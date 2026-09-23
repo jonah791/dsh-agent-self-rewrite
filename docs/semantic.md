@@ -90,6 +90,19 @@ applyRuleUpsert(full: string, req: { blockId: string; draft: string; maxBytes: n
 | 本件 | `<dshHome>/.agent-presets/evolve-live/` | 渲染当前配置（运行时发现，无需重启） | 未落地 |
 | **禁止** | 任何其他插件写 `AGENTS.md` 标记段 | 由 I1 约束（唯一写者） | 待退役验收 |
 
+### 5.4 状态落点契约（迁移期不得搬迁）
+
+被替换的两件各有**独立落点**（2026-09-23 源码实测），新件按旧路径读，不做数据搬迁：
+
+| 旧件 | 配置字段与缺省 | 落盘文件 |
+|---|---|---|
+| `dsh-agent-self-test` | `dataDir?: string`（可选）· 缺省 `join(dshHome, 'agent-self-test')` | `<base>/self-test.json`（`JSON.stringify(state, null, 2)` + `renameSync` 原子写） |
+| `dsh-agent-evolve` | `dataDir: string` · 缺省 `$DSH_HOME/.evolve`（源码内硬编码回退 `E:/alice/.evolve`） | `<dataDir>/ledger.json` · `<dataDir>/resources/<id>` · `<dataDir>/runs/<runId>.json` · `<dataDir>/orphans.jsonl` |
+
+`dsh-agent-evolve` 另有 `RULES_FILE = 'AGENTS.md'`（相对 `workspaceDir`），写入带 `.bak` 备份与 tmp+rename。
+
+**依赖方**：`dsh-evolution-core` 读上述路径的实时状态 ⇒ 新件**保持同路径即可兼容**；只有改字段才需要同步其读取面。
+
 ## 6 · 边界与信任
 
 - **信任源**：只有 `run_full_eval` 的 `summary.json` 是评分权威；本件不自行打分。
@@ -144,7 +157,7 @@ applyRuleUpsert(full: string, req: { blockId: string; draft: string; maxBytes: n
 
 ## 10 · 未决问题
 
-1. **`dsh-evolution-core` 的读取面**：它聚合旧两件的实时状态。本件保留同路径状态文件即可兼容；但若改了字段，`evolution-core` 必须同步——是**保持兼容**还是**一起重设计**，待主人裁。
+1. **`dsh-evolution-core` 的读取面（事实部分已取证）**：旧两件的落点见 §5.4——`<DSH_HOME>/agent-self-test/self-test.json` 与 `<DSH_HOME>/.evolve/{ledger.json, resources/, runs/, orphans.jsonl}`。新件**按同路径读即可兼容**，`evolution-core` 无需改动；待裁的只剩「字段是否原样保留」（保留 ⇒ 零改动；重构字段 ⇒ 需同步其读取面）。
 2. **`AGENTS.md` 余量告急**：实测 64,434 / 截断点约 65,242 ⇒ 余量约 808 字节。新件的 `maxBytes` 缺省值取多少、以及是否该把旧版史继续迁出以腾空间，待定。
 3. **两个历史标记段是否合并**：`evolve` 与 `self-test` 两段语义已同源（都是「规则」），但合并会改 `AGENTS.md` 的既有结构，且 `dsh-evolution-core` 可能按段名读取 ⇒ 迁移期先保持两段，合并与否待裁。
 4. **迁移窗口**：退役 + 重挂载是组合变更，需预检 + 重启；出行期不做。
