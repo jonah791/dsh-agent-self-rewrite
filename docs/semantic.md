@@ -125,6 +125,9 @@ applyRuleUpsert(full: string, req: { blockId: string; draft: string; maxBytes: n
 | 重复 upsert 幂等（第二次内容逐字节不变） | 同上「重复 upsert 幂等」用例 | 已实测 |
 | 文件里没有该标记段时追加到文件尾 | 同上「首次安装」用例 | 已实测 |
 | 预算口径是 UTF-8 字节（`中文` = 6 字节） | 同上「预算口径是 UTF-8 字节」用例 | 已实测 |
+| 兼容读取层区分「不存在 / 损坏 / 形状不符」三态 | `node --test tests/store.test.mjs` 的三条尸体用例 | 已实测 |
+| 状态聚合不把「读不到」报成 0（锚点报「未知」） | `node --test tests/status.test.mjs` 的两条尸体用例 | 已实测 |
+| 兼容层在生产状态上可读（不搬迁数据） | 真实语料冒烟：`collectStatus($DSH_HOME)` 读出 hypotheses=32（13 confirmed / 19 refuted）、ledger=missing、runs=0 | 已实测 |
 | 构建通过且声明文件产出 | `tsc -p tsconfig.json` 退出码 0 | 已实测 |
 | 全仓只有本件写 `AGENTS.md` 标记段 | `grep -rn 'AGENTS.md' self-plugins/*/src/*.ts` 后逐个确认写调用，只有本件命中 | 待验收 |
 | 工具面 6 个可答 | `rewrite_status` 返回假设库与锚点链 | 待验收 |
@@ -140,9 +143,9 @@ applyRuleUpsert(full: string, req: { blockId: string; draft: string; maxBytes: n
 3. **唯一写者取证**：`grep -rn 'AGENTS.md' self-plugins/*/src/*.ts` 后逐个确认**写调用**——只有本件命中（注释里提到不算）。
 4. **落盘产物**：`<dataDir>/ledger.json`、`hypotheses.json`、`runs/<runId>.json` 出现且 mtime 前进。
 
-**当前落点**：`src/wiring.ts`（唯一写原语，已落地）、`tests/wiring.test.mjs`（14 用例，含 5 个尸体）、`lib/`（构建产物）。
+**当前落点**：`src/wiring.ts`（唯一写原语）、`src/store.ts`（迁移期兼容读取层）、`src/status.ts`（状态聚合读侧）、`tests/{wiring,store,status}.test.mjs`（33 用例，含 8 个尸体）、`lib/`（构建产物）。
 
-**未落地落点**：`src/index.ts`、`src/hypotheses.ts`、`src/evaluator.ts`、`src/anchors.ts`、`src/store.ts`。**本件当前不可挂载**（`main` 指向的 `lib/index.js` 尚未实现）。
+**未落地落点**：`src/index.ts`、`src/hypotheses.ts`、`src/evaluator.ts`、`src/anchors.ts`。**本件当前不可挂载**（`main` 指向的 `lib/index.js` 尚未实现）。
 
 **回退**：unmount 本件 → 把 `dsh-agent-self-test` / `dsh-agent-evolve` 从 `_archive/` 还原并重挂；数据未动（同一 `dataDir`）⇒ 无损。
 

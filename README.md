@@ -16,6 +16,8 @@
 |---|---|
 | 脚手架（`package.json` / `tsconfig.json` / `dsh-plugin.json` / `cordis.patch.yml` / `.gitignore`） | 已落地 |
 | 唯一写原语 `src/wiring.ts`（纯函数：upsert + 字节预算守卫 + 标记完整性守卫） | 已落地 + 离线尸体测试 |
+| 迁移期兼容读取层 `src/store.ts`（旧路径解析 + 缺失/损坏/形状三态 fail-loud + 原子写） | 已落地 + 夹具测试 + 真实语料冒烟 |
+| 状态聚合读侧 `src/status.ts`（`rewrite_status` 的纯函数核心） | 已落地 + 尸体测试 |
 | 工具面 6 个（`rewrite_status` / `rewrite_hypothesis` / `rewrite_verdict` / `rewrite_evaluate` / `rewrite_commit` / `rewrite_history`） | **未落地**（下一段） |
 | `src/index.ts`（插件壳与工具注册） | **未落地**（下一段） |
 
