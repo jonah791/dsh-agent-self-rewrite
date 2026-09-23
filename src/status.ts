@@ -24,6 +24,8 @@ export interface StatusInput {
   readonly selfTest: ReadOutcome<SelfTestState>
   readonly ledger: ReadOutcome<Ledger>
   readonly runIds: readonly string[]
+  /** 受管文件的预算读数：`bytes: null` 表示**文件不存在**（与「0 字节」是两件事） */
+  readonly rules?: { readonly path: string; readonly bytes: number | null; readonly maxBytes: number }
 }
 
 export interface StatusCounts {
@@ -95,12 +97,20 @@ export function buildStatus(input: StatusInput): StatusReport {
   const counts: StatusCounts = { ...base, anchors, runs: input.runIds.length }
 
   const anchorText = anchors === null ? '未知（账本不可读）' : String(anchors)
-  const lines = [
-    '自改写引擎 · 状态',
+  const lines = ['自改写引擎 · 状态']
+  if (input.rules !== undefined) {
+    const r = input.rules
+    lines.push(
+      r.bytes === null
+        ? `受管文件：${r.path}（**不存在**——首次写入会追加标记段；此处的「不存在」不等于零字节）`
+        : `受管文件：${r.path}（${r.bytes} 字节 / 上限 ${r.maxBytes}，余量 ${r.maxBytes - r.bytes}）`,
+    )
+  }
+  lines.push(
     `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted}${base.other ? ` / other ${base.other}` : ''}）`,
     `锚点：${anchorText}`,
     `未收尾评测轮：${input.runIds.length}`,
-  ]
+  )
   if (notes.length > 0) lines.push('', '注：', ...notes.map((n) => `- ${n}`))
 
   return { counts, notes, text: lines.join('\n') }

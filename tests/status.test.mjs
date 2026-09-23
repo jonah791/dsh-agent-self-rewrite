@@ -47,6 +47,28 @@ test('尸体：账本读不到 ⇒ 锚点报「未知」，文本里**不得出�
   assert.ok(r.text.includes('锚点：未知（账本不可读）'))
 })
 
+test('尸体：受管文件不存在 ⇒ 预算行报「不存在」，**不报 0 字节**', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [] }),
+    ledger: ok({ resources: {} }),
+    runIds: [],
+    rules: { path: 'E:/nope/AGENTS.md', bytes: null, maxBytes: 64800 },
+  })
+  const line = r.text.split('\n').find((l) => l.startsWith('受管文件：'))
+  assert.ok(line !== undefined && line.includes('不存在'))
+  assert.ok(!/\d+ 字节/.test(line), '预算行不得渲染任何字节数字（值的位置上不许出现 0）')
+})
+
+test('预算行：文件存在 ⇒ 报字节数、上限与余量', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [] }),
+    ledger: ok({ resources: {} }),
+    runIds: [],
+    rules: { path: 'E:/x/AGENTS.md', bytes: 64434, maxBytes: 64800 },
+  })
+  assert.ok(r.text.includes('64434 字节 / 上限 64800，余量 366'))
+})
+
 test('空假设库 ⇒ 明说「猜想环当前无内容」，而不是沉默', () => {
   const r = buildStatus({ selfTest: ok({ hypotheses: [] }), ledger: ok({ resources: {} }), runIds: [] })
   assert.ok(r.notes.some((n) => n.includes('假设库为空')))
