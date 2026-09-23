@@ -56,6 +56,9 @@ export function findBlock(id: string): BlockSpec | undefined {
 
 export type UpsertAction = 'added' | 'exists'
 
+/** 一次写入的动作（`replaced` 只由版本化替换 `applyBlockSet` 产生） */
+export type WriteAction = UpsertAction | 'replaced'
+
 export interface UpsertResult {
   /** 合并后的块内文本（不含 marker 行） */
   readonly inner: string
@@ -125,7 +128,7 @@ export type WriteRejectReason = 'unknown-block' | 'empty-draft' | 'corrupt-marke
 export type WriteOutcome =
   | {
       readonly ok: true
-      readonly action: UpsertAction
+      readonly action: WriteAction
       /** 应写盘的**整文件新内容**（`exists` 时与入参逐字节相同） */
       readonly content: string
       readonly bytes: number
@@ -195,4 +198,59 @@ export function applyRuleUpsert(full: string, req: UpsertRequest): WriteOutcome 
     )
   }
   return { ok: true, action: 'added', content: next, bytes: verdict.bytes, headroom: verdict.headroom }
+}
+
+export interface SetRequest {
+  readonly blockId: string
+  /** 新的块内全文（取代旧内容） */
+  readonly inner: string
+  readonly maxBytes: number
+}
+
+/**
+ * **版本化替换**：把标记段内容整体换成 `inner`（用于 `agent-rules` 这类**版本化资源**）。
+ *
+ * 与 `applyRuleUpsert` 的分工是语义而非安全等级：upsert 表达「累积一条规则」（只增不减、幂等），
+ * 本函数表达「设置该资源的当前版本」（旧内容被新版本取代）。
+ *
+ * 两者**共用同一套标记完整性守卫与字节预算裁决**——这一点是刻意的：被替换的
+ * `dsh-agent-evolve` 用 `full.replace(/start[\s\S]*end/, wrapped)` 做整块替换且**完全不做预算裁决**，
+ * 而 `AGENTS.md` 的注入有硬上限（超限从尾部静默截断）⇒ 那条路径可以在无人察觉时把我的规则段截掉。
+ * 本件不允许任何一条写路径绕过预算。
+ */
+export function applyBlockSet(full: string, req: SetRequest): WriteOutcome {
+  const block = findBlock(req.blockId)
+  if (block === undefined) {
+    const known = MANAGED_BLOCKS.map((b) => b.id).join(' / ')
+    return reject(full, req.maxBytes, 'unknown-block', `未登记的标记段 id：${req.blockId}（已登记：${known}）`)
+  }
+  const start = full.indexOf(block.start)
+  const end = full.indexOf(block.end)
+  if ((start === -1) !== (end === -1)) {
+    return reject(
+      full,
+      req.maxBytes,
+      'corrupt-markers',
+      `标记段 ${block.id} 起止标记只出现一个（start=${start} end=${end}）——拒绝替换`,
+    )
+  }
+  if (start !== -1 && end < start) {
+    return reject(
+      full,
+      req.maxBytes,
+      'corrupt-markers',
+      `标记段 ${block.id} 起止顺序颠倒（start=${start} > end=${end}）——拒绝替换`,
+    )
+  }
+  const next = spliceBlock(full, req.inner, block)
+  const verdict = checkBudget(next, req.maxBytes)
+  if (!verdict.allowed) {
+    return reject(
+      full,
+      req.maxBytes,
+      'over-budget',
+      `写入后 ${verdict.bytes} 字节 > 上限 ${req.maxBytes}（超 ${-verdict.headroom} 字节）——拒绝写盘`,
+    )
+  }
+  return { ok: true, action: 'replaced', content: next, bytes: verdict.bytes, headroom: verdict.headroom }
 }

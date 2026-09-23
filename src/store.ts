@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import type { Polarity, ProbeKind } from './polarity.js'
 
 export interface LegacyPaths {
   readonly selfTestDir: string
@@ -68,18 +69,57 @@ export function readJsonStrict<T>(path: string): ReadOutcome<T> {
   }
 }
 
+/** 一条证据（探针命中记录） */
+export interface Evidence {
+  ts: string
+  kind: ProbeKind
+  detail: Record<string, unknown>
+}
+
+/** 假设状态机 */
+export type HypothesisStatus = 'active' | 'finding' | 'confirmed' | 'refuted' | 'archived'
+
+/**
+ * 探针定义（**住数据里**）。
+ *
+ * `polarity` 是**物化**字段：登记时按 kind 取默认值写进数据，不靠消费方回退到隐式默认表
+ * （2026-09-17 修复的核心——方向判定必须有单一真源）。
+ */
+export interface Probe {
+  kind: ProbeKind
+  polarity?: Polarity
+  tool?: string
+  failureRateAbove?: number
+  minSamples?: number
+  windowMs?: number
+  repeatCount?: number
+  minSteps?: number
+  burstGapMs?: number
+  planWindowMs?: number
+  minActions?: number
+  probeWindowMs?: number
+  claimWindowMs?: number
+  minArranged?: number
+  claimCheckIntervalMs?: number
+}
+
 export interface Hypothesis {
-  readonly id: string
-  readonly statement: string
-  readonly prediction: string
-  readonly status: string
-  readonly threshold: number
-  readonly probe: Record<string, unknown>
-  readonly evidence: readonly unknown[]
+  id: string
+  statement: string
+  prediction: string
+  probe: Probe
+  threshold: number
+  status: HypothesisStatus
+  evidence: Evidence[]
+  createdAt: string
+  updatedAt: string
+  source?: string
+  note?: string
+  resolution?: string
 }
 
 export interface SelfTestState {
-  readonly hypotheses: readonly Hypothesis[]
+  readonly hypotheses: Hypothesis[]
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
