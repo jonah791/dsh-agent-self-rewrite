@@ -92,9 +92,11 @@ applyBlockSet(full, { blockId, inner, maxBytes })     // 版本化替换：块�
 | 旧件 | 配置字段与缺省 | 落盘文件 |
 |---|---|---|
 | `dsh-agent-self-test` | `dataDir?: string` · 缺省 `join(dshHome, 'agent-self-test')` | `<base>/self-test.json`（本件改用原子写 tmp+rename）· `<base>/backups/` |
-| `dsh-agent-evolve` | `dataDir: string` · 缺省 `$DSH_HOME/.evolve` | `<dataDir>/ledger.json` · `<dataDir>/resources/<id>` · `<dataDir>/runs/<runId>.json` · `<dataDir>/orphans.jsonl` |
+| `dsh-agent-evolve` | `dataDir: string` · 源码缺省 `$DSH_HOME/.evolve` | `<dataDir>/ledger.json` · `<dataDir>/resources/<id>` · `<dataDir>/runs/<runId>.json` · `<dataDir>/orphans.jsonl` |
 
-⚠ 2026-09-23 实测：盘上 `.evolve/` **只有 `runs/`，没有 `ledger.json`**（evolve 从未初始化成功）⇒「账本不存在」是**合法状态**，读侧不伪造空账本。
+⚠ **本部署的 `dataDir` 被 profile 覆盖为 `E:/alice/.evolve`**（不是 `<DSH_HOME>/.evolve`）——账本实际在那里（2026-09-23 实测 61,233 字节 / 20 个 run / `resources/` 齐全）。⇒ 新件配置必须显式传 `evolveDataDir: E:/alice/.evolve`，否则会读到一个空的默认路径并误判「从未初始化」。
+
+⚠ 2026-09-23 实测：`<DSH_HOME>/.evolve` 不存在（那是源码缺省值，不是本部署的落点）⇒「账本不存在」**是合法状态**（读侧不伪造空账本），但判断它之前必须先确认读的是哪个 `dataDir`。
 
 ### 5.4 调用点清单
 
