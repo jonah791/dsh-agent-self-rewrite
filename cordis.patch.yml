@@ -1,0 +1,4 @@
+- insert:
+    - id: agent-self-rewrite
+      name: dsh-agent-self-rewrite
+      config: {}
