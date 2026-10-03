@@ -10,6 +10,7 @@
  */
 
 import {
+  TERMINAL_RUN_STATUSES,
   listRuns,
   loadLedger,
   loadSelfTestState,
@@ -17,13 +18,15 @@ import {
   type Ledger,
   type LegacyPaths,
   type ReadOutcome,
+  type RunRecord,
   type SelfTestState,
 } from './store.js'
 
 export interface StatusInput {
   readonly selfTest: ReadOutcome<SelfTestState>
   readonly ledger: ReadOutcome<Ledger>
-  readonly runIds: readonly string[]
+  /** run **记录**（目录里的全部，不只是未收尾的）—— 含 `status`，供如实分解 */
+  readonly runs: readonly RunRecord[]
   /** 受管文件的预算读数：`bytes: null` 表示**文件不存在**（与「0 字节」是两件事） */
   readonly rules?: { readonly path: string; readonly bytes: number | null; readonly maxBytes: number }
 }
@@ -37,7 +40,10 @@ export interface StatusCounts {
   readonly other: number
   /** 账本可读时的锚点数；不可读时为 `null`（**不是 0**） */
   readonly anchors: number | null
+  /** runs 目录里的**记录数**——**不是**「未收尾轮次数」（后者是 `unclosed`） */
   readonly runs: number
+  /** 真正未收尾的记录数（`status` 不在 `TERMINAL_RUN_STATUSES` 内） */
+  readonly unclosed: number
 }
 
 export interface StatusReport {
@@ -50,7 +56,7 @@ export interface StatusReport {
 /** 假设库里的四种已知终态之外的都归 `other`（不猜、不吞） */
 const KNOWN = new Set(['active', 'finding', 'confirmed', 'refuted'])
 
-export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusCounts, 'anchors' | 'runs'> {
+export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusCounts, 'anchors' | 'runs' | 'unclosed'> {
   let active = 0
   let findings = 0
   let confirmed = 0
@@ -76,6 +82,33 @@ export function countAnchors(ledger: ReadOutcome<Ledger>): number | null {
   return n
 }
 
+/**
+ * 未收尾记录数：`status` **不在**终态集合内的。
+ *
+ * ⚠ 未知状态一律计入未收尾（宁可多报不可漏报）——终态是**白名单**，不是黑名单。
+ */
+export function countUnclosed(runs: readonly RunRecord[]): number {
+  const terminal = new Set<string>(TERMINAL_RUN_STATUSES)
+  return runs.filter((r) => !terminal.has(r.status)).length
+}
+
+/**
+ * 状态分布串（如 `done 11 · failed 9`）。
+ *
+ * **为什么要有它**：2026-10-03 修正前 `rewrite_status` 只报一个数并标成「未收尾评测轮」——
+ * 实测该目录 20 条里 `done 11 · failed 9`、未收尾 **0**，那个标签误导了一整圈排查。
+ * 把分布摆出来，让人一眼看出这个数由什么构成（§5.9 规则 6：读数自带范围标注）。
+ */
+export function statusBreakdown(runs: readonly RunRecord[]): string {
+  const order: readonly string[] = ['pending', 'running', ...TERMINAL_RUN_STATUSES]
+  const tally = new Map<string, number>()
+  for (const r of runs) tally.set(r.status, (tally.get(r.status) ?? 0) + 1)
+  if (tally.size === 0) return '无记录'
+  const known = order.filter((s) => tally.has(s))
+  const unknown = [...tally.keys()].filter((s) => !order.includes(s)).sort()
+  return [...known, ...unknown].map((s) => `${s} ${tally.get(s)}`).join(' · ')
+}
+
 export function buildStatus(input: StatusInput): StatusReport {
   const notes: string[] = []
 
@@ -92,9 +125,14 @@ export function buildStatus(input: StatusInput): StatusReport {
   if (!input.ledger.ok) {
     notes.push(`锚点链不可用（${input.ledger.reason}）：${input.ledger.detail}——锚点计数为「未知」，不是 0`)
   }
-  if (input.runIds.length === 0) notes.push('无未收尾评测轮')
+  const unclosed = countUnclosed(input.runs)
+  if (input.runs.length === 0) {
+    notes.push('runs 目录为空：引擎尚未跑过任何评测轮（「目录为空」与「跑了但都收尾了」是两件事）')
+  } else if (unclosed === 0) {
+    notes.push(`runs 记录 ${input.runs.length} 条，全部已收尾（${statusBreakdown(input.runs)}）——无挂起轮次`)
+  }
 
-  const counts: StatusCounts = { ...base, anchors, runs: input.runIds.length }
+  const counts: StatusCounts = { ...base, anchors, runs: input.runs.length, unclosed }
 
   const anchorText = anchors === null ? '未知（账本不可读）' : String(anchors)
   const lines = ['自改写引擎 · 状态']
@@ -109,7 +147,7 @@ export function buildStatus(input: StatusInput): StatusReport {
   lines.push(
     `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted}${base.other ? ` / other ${base.other}` : ''}）`,
     `锚点：${anchorText}`,
-    `未收尾评测轮：${input.runIds.length}`,
+    `runs 记录：${input.runs.length}（${statusBreakdown(input.runs)}）· 未收尾 ${unclosed}`,
   )
   if (notes.length > 0) lines.push('', '注：', ...notes.map((n) => `- ${n}`))
 
@@ -121,6 +159,6 @@ export function collectStatus(paths: LegacyPaths): StatusReport {
   return buildStatus({
     selfTest: loadSelfTestState(paths),
     ledger: loadLedger(paths),
-    runIds: listRuns(paths),
+    runs: listRuns(paths),
   })
 }

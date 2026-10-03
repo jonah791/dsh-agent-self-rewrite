@@ -248,7 +248,7 @@ export function apply(ctx: Context, config: Config): void {
       const report = buildStatus({
         selfTest: loadSelfTestState(paths),
         ledger: loadLedger(paths),
-        runIds: listRuns(paths),
+        runs: listRuns(paths),
         rules: { path: rulesPath, bytes: readRulesBytes(rulesPath), maxBytes: config.maxBytes },
       })
       const lines = [report.text]

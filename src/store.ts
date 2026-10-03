@@ -172,16 +172,55 @@ export function loadLedger(paths: LegacyPaths): ReadOutcome<Ledger> {
   return { ok: true, value: read.value }
 }
 
-/** 列出未收尾评测轮 id（目录不存在 ⇒ 空表，不是错误） */
-export function listRuns(paths: LegacyPaths): readonly string[] {
+/**
+ * 一条 run 记录的**最小可读形状**。
+ *
+ * 与 `orphans.RunStateLike` 同形；此处**独立定义**而非 import —— 后者注释即写明
+ * 「避免与 store 循环依赖」。
+ */
+export interface RunRecord {
+  readonly runId: string
+  readonly status: string
+  readonly at: string
+  readonly gen: number
+  /** 收尸标记（存在即已被 `reap` 处理过）；形状不校验，只用于计数 */
+  readonly reaped?: unknown
+}
+
+/** 终态：这些 status 之外的（pending/running）才算「未收尾」。 */
+export const TERMINAL_RUN_STATUSES = ['done', 'failed'] as const
+
+/** 形状校验：`runId` 与 `status` 都是字符串才算一条记录（`{}` 这类空壳一律不算）。 */
+export function isRunRecord(v: unknown): v is RunRecord {
+  return isRecord(v) && typeof v.runId === 'string' && typeof v.status === 'string'
+}
+
+/**
+ * 读取全部 run 记录。
+ *
+ * ⚠ **2026-10-03 修正（名实不符）**：本函数此前返回 `readonly string[]`（只有 id），
+ * 而函数名与注释都写「列出**未收尾**评测轮 id」—— 调用方 `rewrite_status` 遂把
+ * 「runs 目录条目数」当「未收尾轮次数」显示。实测该目录 20 条中 `done 11 · failed 9`、
+ * **未收尾 0**，而工具报「未收尾评测轮：20」⇒ 一个措辞不准的读数制造了不存在的矛盾
+ * （当天为此排查一整圈）。现在返回记录本身，让调用方**按 status 如实分解**。
+ *
+ * 目录不存在 ⇒ 空表；单条不可读 / 坏 JSON / **形状不符** ⇒ **跳过该条**
+ * （不伪造、不让整批失败、也不把空壳当记录）。
+ */
+export function listRuns(paths: LegacyPaths): readonly RunRecord[] {
   if (!existsSync(paths.runsDir)) return []
+  let names: readonly string[]
   try {
-    return readdirSync(paths.runsDir)
-      .filter((n) => n.endsWith('.json'))
-      .map((n) => n.slice(0, -'.json'.length))
+    names = readdirSync(paths.runsDir).filter((n) => n.endsWith('.json'))
   } catch {
     return []
   }
+  const out: RunRecord[] = []
+  for (const n of names) {
+    const read = readJsonStrict<RunRecord>(join(paths.runsDir, n))
+    if (read.ok && isRunRecord(read.value)) out.push(read.value)
+  }
+  return out
 }
 
 /** 原子写 JSON：先写临时文件再 rename；失败**响亮抛出**（不静默丢内容） */

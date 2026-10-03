@@ -131,15 +131,19 @@ test('尸体：账本不存在 ⇒ missing，**不伪造空账本**（未初始�
   }
 })
 
-test('listRuns：目录不存在 ⇒ 空表（不是错误）；存在则只取 .json 并剥扩展名', () => {
+test('listRuns：目录不存在 ⇒ 空表；取全部 .json **记录**（含 status），坏条目与空壳跳过', () => {
   const { root, paths } = sandbox()
   try {
     assert.deepEqual(listRuns(paths), [])
     mkdirSync(paths.runsDir, { recursive: true })
-    writeFileSync(join(paths.runsDir, 'run-a.json'), '{}', 'utf8')
-    writeFileSync(join(paths.runsDir, 'run-b.json'), '{}', 'utf8')
-    writeFileSync(join(paths.runsDir, 'notes.txt'), 'x', 'utf8')
-    assert.deepEqual([...listRuns(paths)].sort(), ['run-a', 'run-b'])
+    const rec = (id, status) => JSON.stringify({ runId: id, gen: 1, status, at: '2026-10-03T00:00:00.000Z' })
+    writeFileSync(join(paths.runsDir, 'run-a.json'), rec('run-a', 'done'), 'utf8')
+    writeFileSync(join(paths.runsDir, 'run-b.json'), rec('run-b', 'failed'), 'utf8')
+    writeFileSync(join(paths.runsDir, 'notes.txt'), 'x', 'utf8')        // 非 .json ⇒ 忽略
+    writeFileSync(join(paths.runsDir, 'broken.json'), '{oops', 'utf8')  // 坏 JSON ⇒ 跳过该条
+    writeFileSync(join(paths.runsDir, 'shell.json'), '{}', 'utf8')      // 空壳（缺 runId/status）⇒ 跳过
+    const got = [...listRuns(paths)].map((r) => `${r.runId}:${r.status}`).sort()
+    assert.deepEqual(got, ['run-a:done', 'run-b:failed'])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

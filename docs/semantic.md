@@ -53,7 +53,7 @@
 
 | 工具 | 意图 | 合并了谁 |
 |---|---|---|
-| `rewrite_status` | 一屏看全：预算 / 假设四态 / 待裁决 finding / 锚点链 / 未收尾轮 / 孤儿 | `selftest_list` + `evolve_status` + `evolve_ledger` + `evolve_orphans` |
+| `rewrite_status` | 一屏看全：预算 / 假设四态 / 待裁决 finding / 锚点链 / **runs 记录分布 + 未收尾数** / 孤儿 | `selftest_list` + `evolve_status` + `evolve_ledger` + `evolve_orphans` |
 | `rewrite_hypothesis` | `add` 登记 / `refine` 细化 / `archive` 淘汰 / `list` 列出 | `selftest_add`（+ refine / archive 分支） |
 | `rewrite_verdict` | 裁决并**当场布线**——**唯一写 `AGENTS.md` 的入口** | `selftest_review` + `evolve_edit` 的 agent-rules 分支 |
 | `rewrite_evaluate` | `init` / `start` / `spawn` / `submit` / `reap` / `orphans` | `evolve_init` + `evolve_round_start` + `evolve_spawn` + `evolve_submit` + `evolve_reap` |
@@ -123,6 +123,7 @@ applyBlockSet(full, { blockId, inner, maxBytes })     // 版本化替换：块�
 - **危险面**：`rewrite_verdict` / `rewrite_commit(edit|rollback)` 直接改我的规则 ⇒ 影响我自己的行为。兜底 = 锚点链 + `rollback` + **字节预算守卫（超限拒写）** + 写前备份。
 - **预算口径**：UTF-8 字节数。`AGENTS.md` 在 2026-09-23 实测 64,434 字节，注入截断点约 65,242 ⇒ 余量仅约 808 字节，`maxBytes` 缺省取 64,800。
 - **失败语义（不静默）**：四类拒写 · 假设库损坏 · 评测无 summary · 工作区缺失 · 未收尾轮——都抛带诊断的错误。
+- **runs 读数的口径（2026-10-03 修正）**：`listRuns` 返回**记录对象**（含 `status`）；`rewrite_status` 报「runs 记录 N（分布）· 未收尾 M」。⚠ **`runs` 目录条目数 ≠ 未收尾数**——此前把前者标成「未收尾评测轮」曾误导一整圈排查（实测 20 条为 done 11 / failed 9 / 未收尾 **0**）。未收尾判据是**白名单**：`status ∉ {done, failed}`，**未知状态一律计入未收尾**（宁可多报不可漏报）。坏 JSON 与形状不符的条目**逐条跳过**，不让整批失败。
 - **凭据**：不读凭据；联网仅限评测脚本自身。
 
 ## 7 · 可证伪验收
@@ -145,6 +146,8 @@ applyBlockSet(full, { blockId, inner, maxBytes })     // 版本化替换：块�
 | 全仓只有本件写 `AGENTS.md` 标记段 | `grep -rn 'AGENTS.md' self-plugins/*/src/*.ts` 后逐个确认**写调用** | 待验收 |
 | 旧两件退役后五环仍完整 | `evolution_cycle` 报五环健康且无断点 | 待线上验收 |
 | 采证不双记（旧件退役后单一引擎） | 退役前后同一次工具调用的证据增量比对 | 待线上验收 |
+| **runs 记录数 ≠ 未收尾数**（旧标签「未收尾评测轮：N」不再出现） | `node --test tests/*.test.mjs` 的「全终态：记录数与未收尾分离」「未收尾判据是白名单」「端到端：夹具目录真写 run 文件」三条用例 | 已实测（184/184 全绿） |
+| 坏 JSON / 形状不符（空壳 `{}`）的 run 条目**逐条跳过**，不让整批失败、不把空壳当记录 | 同上「端到端」用例（夹一个坏 JSON + 一个空壳）；`store.test.mjs` 同名用例 | 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -170,6 +173,7 @@ applyBlockSet(full, { blockId, inner, maxBytes })     // 版本化替换：块�
 | 2026-09-23 | 移植 15 个模块 + 8 个测试文件，**零改动即编译通过、零漂移全绿**——说明旧两件的模块层本就自包含，融合的真实成本在工具层而非模块层。 |
 | 2026-09-23 | **实现中发现设计稿的一处语义缺口**：设计说「evolve 的标记段重写逻辑改为调用 `upsertRuleBlock`」，但 upsert 表达的是「累积一条规则」，而资源模型要的是**版本化替换**。补第二条原语 `applyBlockSet`，**共用同一套守卫与预算**——这是刻意的：被替换的 `dsh-agent-evolve` 用 `full.replace(/start[\s\S]*end/, wrapped)` 做整块替换且**完全不做预算裁决**，那条路径可以在无人察觉时把我的规则段截掉。 |
 | 2026-09-23 | 读旧实现确认了两处**必须不复制**的行为：① `loadState` 把「文件不存在」与「JSON 损坏」都吞成空库，随后会把空库写回盘（**静默清空整库**）⇒ 本件损坏即抛错；② 探针回调在旧件里未整体包 `guarded` ⇒ 本件包住（§5.24 逃逸异常会杀宿主）。 |
+| 2026-10-03 | **名实不符的读数制造了不存在的矛盾**：`listRuns` 的唯一调用方 `rewrite_status` 把「runs 目录条目数」显示为「未收尾评测轮：20」；实测该目录 20 条为 `done 11 · failed 9`、**未收尾 0**。我为这个假矛盾排查一整圈（先后排除孤儿 / stale 构建 / 未收尾三个假设）；真因另有独立一层——`evolveDataDir` 被 profile patch 覆盖到 `E:/alice/.evolve`，而 `plugin_inspect` 的 `config` 字段报空、看不出该配置。**修正**：`listRuns` 返回记录对象（含 `status`，过形状白名单），`status.ts` 报「runs 记录 N（分布）· 未收尾 M」，未收尾取白名单（未知一律计入）。**教训**：只报一个数、且措辞不准的读数，比不报更危险——它让读者（包括我）为一个不存在的问题投入整圈。 |
 
 ## 10 · 未决问题
 
