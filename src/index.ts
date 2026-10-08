@@ -17,8 +17,8 @@
  * @module dsh-agent-self-rewrite
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join, relative, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -32,7 +32,7 @@ import type { ResourceId } from './types.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
 import { buildStatus } from './status.js'
-import { applyBlockSet, applyRuleUpsert, MANAGED_BLOCKS, type WriteOutcome } from './wiring.js'
+import { applyBlockSet, applyRuleUpsertWithRecycle, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
 import {
   addHypothesis,
   applyVerdict,
@@ -84,6 +84,10 @@ export interface Config {
   maxBytes: number
   /** 规则**累积**写入的标记段（`rewrite_verdict` 用） */
   rulesBlockId: string
+  /** 回收归档层（段撞预算时迁出的最旧条目落这里）；留空 ⇒ `<workspaceDir>/docs/agents-md-archive.md` */
+  archivePath: string
+  /** 回收的**目标余量**（字节）：迁到余量回到这个数才停；缺省 1024（只求「刚好放下」会让下次立刻又撞线） */
+  recycleReserveBytes: number
   /** 覆盖旧件 `dsh-agent-self-test` 的 dataDir（留空 ⇒ `<DSH_HOME>/agent-self-test`） */
   selfTestDataDir: string
   /** 覆盖旧件 `dsh-agent-evolve` 的 dataDir（留空 ⇒ `<DSH_HOME>/.evolve`） */
@@ -106,6 +110,8 @@ export const Config = z.object({
   rulesFile: z.string().default('AGENTS.md'),
   maxBytes: z.number().default(64800),
   rulesBlockId: z.string().default('self-test'),
+  archivePath: z.string().default(''),
+  recycleReserveBytes: z.number().default(1024),
   selfTestDataDir: z.string().default(''),
   evolveDataDir: z.string().default(''),
   modeltestDir: z.string().default(''),
@@ -180,9 +186,61 @@ function describeWrite(outcome: WriteOutcome): string {
   return '未写入：' + outcome.reason + '——' + outcome.detail
 }
 
+/**
+ * 追加回收归档（**只追加**，一条一行）。归档层的唯一写者就是本件（语义文档 §5.6）。
+ *
+ * 顺序语义：调用方**先归档、后写 AGENTS.md**。归档抛错时段还没动 ⇒ 状态一致；
+ * 反过来就成了「条目已迁出但无处可寻」。反向失败（归档成功、写段失败）只产生重复——
+ * **宁可重复，不可丢失**（同 `upsertRuleBlock` 的方向性）。
+ */
+function appendArchive(archivePath: string, entries: readonly string[], blockId: string): void {
+  const date = new Date().toISOString().slice(0, 10)
+  const body = entries.map((e) => '- [' + date + ' · ' + blockId + '] ' + e).join('\n')
+  mkdirSync(dirname(archivePath), { recursive: true })
+  const header = existsSync(archivePath)
+    ? ''
+    : '# AGENTS.md 受管段 · 回收归档\n\n'
+      + '> 由 `dsh-agent-self-rewrite` v0.6.0 起自动追加：累积段撞字节预算时，从**最旧**一端迁出的条目落在此处。\n'
+      + '> 段内留有一行指针指向本文件。**只追加**，不修改既有行。\n\n'
+  appendFileSync(archivePath, header + body + '\n', 'utf8')
+}
+
+/** 归档层体量读数（§5.22：机制必须自证——「归档多大、装了几条」要现算可答，不靠考古） */
+export function readArchiveStats(archivePath: string): { bytes: number; entries: number } | null {
+  if (!existsSync(archivePath)) return null
+  try {
+    const text = readFileSync(archivePath, 'utf8')
+    return {
+      bytes: Buffer.byteLength(text, 'utf8'),
+      entries: text.split('\n').filter((line) => line.startsWith('- [')).length,
+    }
+  } catch {
+    return null // 读不到 ≠ 为空：返回 null，由调用方区分呈现
+  }
+}
+
+/** 回收结果的呈现文本（I11：回收不许静默——迁了几条、去了哪、达没达安全区都要看得见） */
+function describeRecycle(write: RecycleWriteOutcome, archivePath: string): string {
+  if (write.outcome.ok) {
+    if (write.recycled.length === 0) return describeWrite(write.outcome)
+    const tight = write.stopped === 'tight' ? '；⚠ 余量仍未回到目标区（已尽力：只迁放得下所需的最少条数）' : ''
+    return '已新增 1 条（余量 ' + String(write.outcome.headroom) + ' 字节）· **回收 ' + String(write.recycled.length)
+      + ' 条**最旧规则至 ' + archivePath + '（段内留指针）' + tight
+  }
+  const why = write.stopped === 'exhausted' ? '（已试回收：迁到只剩 1 条仍放不下——正文本体吃掉了全部余量）' : ''
+  return describeWrite(write.outcome) + why
+}
+
 export function apply(ctx: Context, config: Config): void {
   const dshHome = resolveDshHome()
   const rulesPath = resolveRulesPath(config, dshHome)
+  // 回收归档层（§5.6）：缺省落在与受管文件同一工作区的 docs/ 下
+  const workspaceRoot = config.workspaceDir.trim().length > 0 ? config.workspaceDir.trim() : dirname(dshHome)
+  const archivePath = config.archivePath.trim().length > 0
+    ? config.archivePath.trim()
+    : join(workspaceRoot, 'docs', 'agents-md-archive.md')
+  /** 段内指针行里的归档路径：相对受管文件所在目录、正斜杠（指针行占的是**段内字节**，越短越好） */
+  const relArchive = relative(dirname(rulesPath), archivePath).split(sep).join('/')
   const paths: LegacyPaths = resolveLegacyPaths(dshHome, {
     selfTestDataDir: config.selfTestDataDir.trim() || undefined,
     evolveDataDir: config.evolveDataDir.trim() || undefined,
@@ -261,6 +319,10 @@ export function apply(ctx: Context, config: Config): void {
       const orphans = listOrphans(store, 3)
       lines.push('孤儿 run：' + String(orphans.length) + (orphans.length > 0 ? '\n' + orphans.map((o) => '  · ' + o).join('\n') : ''))
       lines.push('受管标记段：' + MANAGED_BLOCKS.map((b) => b.id).join(' / ') + '（累积写入 → ' + config.rulesBlockId + '）')
+      const archive = readArchiveStats(archivePath)
+      lines.push('回收归档：' + relArchive + '（' + (archive === null
+        ? '尚未产生——累积段还没撞过预算'
+        : String(archive.entries) + ' 条 / ' + String(archive.bytes) + ' 字节') + '）')
       return { text: lines.join('\n') }
     },
   }))
@@ -375,9 +437,21 @@ export function apply(ctx: Context, config: Config): void {
       let wired = ''
       if (outcome.needsWiring && args.ruleDraft !== undefined) {
         const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
-        const write = applyRuleUpsert(full, { blockId: config.rulesBlockId, draft: args.ruleDraft, maxBytes: config.maxBytes })
-        if (write.ok && write.action !== 'exists') commitRulesWrite(rulesPath, write.content, backupsDir(paths))
-        wired = '\n布线：' + describeWrite(write)
+        const pointerFor = (n: number): string =>
+          RECYCLE_POINTER_PREFIX + ' 已回收 ' + String(n) + ' 条至 ' + relArchive + '（' + new Date().toISOString().slice(0, 10) + '）'
+        const write = applyRuleUpsertWithRecycle(full, {
+          blockId: config.rulesBlockId,
+          draft: args.ruleDraft,
+          maxBytes: config.maxBytes,
+          pointerFor,
+          reserveBytes: config.recycleReserveBytes,
+        })
+        if (write.outcome.ok && write.outcome.action !== 'exists') {
+          // 顺序是刻意的：**先归档、后写段**——归档失败时段还没动，状态一致（§5.6）
+          if (write.recycled.length > 0) appendArchive(archivePath, write.recycled, config.rulesBlockId)
+          commitRulesWrite(rulesPath, write.outcome.content, backupsDir(paths))
+        }
+        wired = '\n布线：' + describeRecycle(write, relArchive)
       }
       return {
         text: '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status

@@ -148,46 +148,73 @@ function reject(full: string, maxBytes: number, reason: WriteRejectReason, detai
   return { ok: false, reason, detail, bytes: verdict.bytes, headroom: verdict.headroom }
 }
 
+/** 多行草稿折叠为单行——段是**规则清单**（一条一行），回收按行切分才有意义 */
+export function flattenDraft(text: string): string {
+  return text.replace(/\s*\n\s*/g, ' ').trim()
+}
+
+/** 前置守卫结果：通过 ⇒ 给出段登记项；否则给出**已构造好的**拒绝结果 */
+type GuardResult = { readonly ok: true; readonly block: BlockSpec } | { readonly ok: false; readonly outcome: WriteOutcome }
+
 /**
- * **唯一写入口**：一次调用完成「登记校验 → 标记完整性校验 → upsert → 预算裁决」。
- *
- * 返回 `ok: true` 才允许落盘；任何拒绝路径都**不改动入参内容**（返回值里没有新内容）。
- * 四类拒绝都是**响亮**的（带闭集 reason 与可诊断 detail），不静默降级。
+ * 前置守卫（登记 → 空草稿 → 标记完整性）。两条写路径**共用**它——
+ * 复制一份守卫就是复制一处会漂移的真理（I3 的落地形态）。
  */
-export function applyRuleUpsert(full: string, req: UpsertRequest): WriteOutcome {
+function guard(full: string, req: { readonly blockId: string; readonly draft: string; readonly maxBytes: number }): GuardResult {
   const block = findBlock(req.blockId)
   if (block === undefined) {
     const known = MANAGED_BLOCKS.map((b) => b.id).join(' / ')
-    return reject(full, req.maxBytes, 'unknown-block', `未登记的标记段 id：${req.blockId}（已登记：${known}）`)
+    return { ok: false, outcome: reject(full, req.maxBytes, 'unknown-block', `未登记的标记段 id：${req.blockId}（已登记：${known}）`) }
   }
-  if (normalizeRule(req.draft) === '') {
-    return reject(full, req.maxBytes, 'empty-draft', '空草稿：拒绝写入（调用方的规则串构造有误）')
+  if (flattenDraft(req.draft) === '') {
+    return { ok: false, outcome: reject(full, req.maxBytes, 'empty-draft', '空草稿：拒绝写入（调用方的规则串构造有误）') }
   }
   const start = full.indexOf(block.start)
   const end = full.indexOf(block.end)
   if ((start === -1) !== (end === -1)) {
-    return reject(
-      full,
-      req.maxBytes,
-      'corrupt-markers',
-      `标记段 ${block.id} 起止标记只出现一个（start=${start} end=${end}）——拒绝追加，以免产生第二个块`,
-    )
+    return {
+      ok: false,
+      outcome: reject(
+        full,
+        req.maxBytes,
+        'corrupt-markers',
+        `标记段 ${block.id} 起止标记只出现一个（start=${start} end=${end}）——拒绝追加，以免产生第二个块`,
+      ),
+    }
   }
   if (start !== -1 && end < start) {
-    return reject(
-      full,
-      req.maxBytes,
-      'corrupt-markers',
-      `标记段 ${block.id} 起止顺序颠倒（start=${start} > end=${end}）——追加会产出读不回来的块，拒绝`,
-    )
+    return {
+      ok: false,
+      outcome: reject(
+        full,
+        req.maxBytes,
+        'corrupt-markers',
+        `标记段 ${block.id} 起止顺序颠倒（start=${start} > end=${end}）——追加会产出读不回来的块，拒绝`,
+      ),
+    }
   }
-  const existing = extractBlockInner(full, block) ?? ''
-  const merged = upsertRuleBlock(existing, req.draft)
+  return { ok: true, block }
+}
+
+/**
+ * **唯一写入口**（累积路径）：一次调用完成「登记校验 → 标记完整性校验 → upsert → 预算裁决」。
+ *
+ * 返回 `ok: true` 才允许落盘；任何拒绝路径都**不改动入参内容**（返回值里没有新内容）。
+ * 四类拒绝都是**响亮**的（带闭集 reason 与可诊断 detail），不静默降级。
+ *
+ * 撞预算时本函数**拒写**（不做回收）——要回收请用 `applyRuleUpsertWithRecycle`。
+ * 两者的分工是**调用方的策略选择**，不是安全等级（守卫与预算裁决完全共用）。
+ */
+export function applyRuleUpsert(full: string, req: UpsertRequest): WriteOutcome {
+  const g = guard(full, req)
+  if (!g.ok) return g.outcome
+  const existing = extractBlockInner(full, g.block) ?? ''
+  const merged = upsertRuleBlock(existing, flattenDraft(req.draft))
   if (merged.action === 'exists') {
     const verdict = checkBudget(full, req.maxBytes)
     return { ok: true, action: 'exists', content: full, bytes: verdict.bytes, headroom: verdict.headroom }
   }
-  const next = spliceBlock(full, merged.inner, block)
+  const next = spliceBlock(full, merged.inner, g.block)
   const verdict = checkBudget(next, req.maxBytes)
   if (!verdict.allowed) {
     return reject(
@@ -253,4 +280,162 @@ export function applyBlockSet(full: string, req: SetRequest): WriteOutcome {
     )
   }
   return { ok: true, action: 'replaced', content: next, bytes: verdict.bytes, headroom: verdict.headroom }
+}
+
+// ---------- 回收（v0.6.0 · 2026-10-08）：撞线时迁最旧条，不再人肉腾空间 ----------
+//
+// 触发背景：累积段 `self-test` 实测 4,666 B / 11 条且**只增不减**，全文件余量 1,245 B
+// ÷ 条目中位 382 B ⇒ 再约 3 条规则就撞线；而此前唯一的腾空间手段是**降级一条正本规则的
+// 表达力**（单调消耗，不可持续）。第三版能力「回收」补上「变旧」这一维：
+// v0.5.0 管不丢（upsert）→ v0.5.1 管不超（预算守卫）→ 本版管**变旧**。
+
+/** 段内条目切分：**非空行即一条**（trim 后丢弃空行——段是规则清单，不是格式敏感文档） */
+export function splitEntries(inner: string): string[] {
+  return inner
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+}
+
+/** 条目拼回段内文本（`splitEntries` 的逆；往返**幂等**而非逐字，见语义文档 §7） */
+export function joinEntries(entries: readonly string[]): string {
+  return entries.join('\n')
+}
+
+/** 回收指针行前缀——**单一真源**（写入与识别共用：靠它把旧指针从条目里剥掉，避免叠加） */
+export const RECYCLE_POINTER_PREFIX = '> ⤵'
+
+export interface RecycleResult {
+  /** 回收后的段内文本 */
+  readonly inner: string
+  /** 迁出的条目（旧 → 新） */
+  readonly recycled: readonly string[]
+  readonly stopped: 'fits' | 'exhausted'
+}
+
+/**
+ * 回收：从**最旧**一端逐条移出，直到 `fits` 为真或只剩 `keep` 条。
+ *
+ * `fits` 是**注入的谓词**（候选段内文本 → 是否可接受）⇒ 本函数不碰文件系统，可离线证伪。
+ * 方向是刻意的：只迁最旧（新规则还在被引用），且**绝不迁空**（空段 = 该段机制失效）。
+ */
+export function recycleOldest(inner: string, fits: (candidateInner: string) => boolean, keep = 1): RecycleResult {
+  const head = joinEntries(splitEntries(inner))
+  if (fits(head)) return { inner: head, recycled: [], stopped: 'fits' }
+  const recycled: string[] = []
+  let rest = splitEntries(inner)
+  const floor = Math.max(1, Math.floor(keep))
+  while (rest.length > floor) {
+    recycled.push(rest[0] as string)
+    rest = rest.slice(1)
+    if (fits(joinEntries(rest))) return { inner: joinEntries(rest), recycled, stopped: 'fits' }
+  }
+  return { inner: joinEntries(rest), recycled, stopped: 'exhausted' }
+}
+
+/** 拼出「条目 + 指针行」；`pointerFor` 缺省时沿用 `stalePointer`（不让既有条目的可达性丢失） */
+function withPointer(
+  entries: readonly string[],
+  count: number,
+  pointerFor: ((n: number) => string) | undefined,
+  stalePointer: string | undefined,
+): string {
+  const body = joinEntries(entries)
+  const line = count > 0 && pointerFor !== undefined ? pointerFor(count).trim() : (stalePointer ?? '')
+  return line === '' ? body : body + '\n' + line
+}
+
+export interface RecycleWriteRequest extends UpsertRequest {
+  /** 段尾指针行构造器（纯函数；返回 '' ⇒ 不留指针）。缺省 ⇒ 沿用既有指针行 */
+  readonly pointerFor?: (recycledCount: number) => string
+  /** 至少保留几条规则（缺省 1） */
+  readonly keep?: number
+  /**
+   * 回收的**目标余量**（字节，缺省 1,024）。
+   *
+   * 只迁到「刚好放下」是不够的——那样下一次写入立刻又撞线（实测：迁到 allowed 时余量只剩 490 B）。
+   * 本参数让回收以「回到安全区」为目标；迁到只剩 `keep` 条仍达不到时**尽力而为**（放得下就放行，
+   * 但 `stopped` 报 `tight`，不谎报「已回安全区」）。
+   */
+  readonly reserveBytes?: number
+}
+
+/** `not-needed` = 没撞线；`fits` = 迁到目标余量；`tight` = 放得下但没到目标余量；`exhausted` = 迁不动仍放不下 */
+export type RecycleStop = 'not-needed' | 'fits' | 'tight' | 'exhausted'
+
+export interface RecycleWriteOutcome {
+  readonly outcome: WriteOutcome
+  /** 实际迁出的条目（旧 → 新）。**仅在 `outcome.ok === true` 时非空**——拒写时没有任何东西被迁走 */
+  readonly recycled: readonly string[]
+  readonly stopped: RecycleStop
+}
+
+/**
+ * **累积路径 + 回收**：撞预算时先迁最旧条，迁够就放行，迁不动才照旧拒写。
+ *
+ * 与 `applyRuleUpsert` 的分工是**调用方的策略选择**，不是安全等级——两者共用同一套守卫与
+ * 预算裁决（I3），本函数只是多了一个「超限时的下一步」。
+ *
+ * 四条刻意的不变量：
+ * - `ok: false` ⇒ `recycled` 恒为空（调用方**不可能**误把没收到的迁移写进归档）；
+ * - 只迁**最旧**、且保留 ≥ `keep` 条（I10）；
+ * - 迁了几条 / 停止原因**一律回传**（I11：回收不许静默）；
+ * - 目标是 `reserveBytes` 安全区；达不到时尽力而为并如实报 `tight`，**不谎报达标**。
+ */
+export function applyRuleUpsertWithRecycle(full: string, req: RecycleWriteRequest): RecycleWriteOutcome {
+  const request: UpsertRequest = { blockId: req.blockId, draft: req.draft, maxBytes: req.maxBytes }
+  const direct = applyRuleUpsert(full, request)
+  if (direct.ok) return { outcome: direct, recycled: [], stopped: 'not-needed' }
+  if (direct.reason !== 'over-budget') return { outcome: direct, recycled: [], stopped: 'not-needed' }
+
+  const block = findBlock(req.blockId)
+  if (block === undefined) return { outcome: direct, recycled: [], stopped: 'not-needed' }
+  const existing = extractBlockInner(full, block) ?? ''
+  const merged = upsertRuleBlock(existing, flattenDraft(req.draft))
+  if (merged.action === 'exists') return { outcome: direct, recycled: [], stopped: 'not-needed' }
+
+  const budgetOf = (candidateInner: string): BudgetVerdict =>
+    checkBudget(spliceBlock(full, candidateInner, block), req.maxBytes)
+
+  // 指针是**状态**不是条目：先把它从条目里剥掉（重复回收替换它，不叠加），留作兜底
+  const all = splitEntries(merged.inner)
+  const stalePointer = all.find((line) => line.startsWith(RECYCLE_POINTER_PREFIX))
+  const entries = all.filter((line) => !line.startsWith(RECYCLE_POINTER_PREFIX))
+
+  const keep = Math.max(1, Math.floor(req.keep ?? 1))
+  const reserve = Math.max(0, Math.floor(req.reserveBytes ?? 1024))
+  const recycled: string[] = []
+  let rest = entries
+  let chosen: string | null = null
+  let fallback: { inner: string; count: number } | null = null
+  let stopped: RecycleStop = 'exhausted'
+  while (rest.length > keep) {
+    recycled.push(rest[0] as string)
+    rest = rest.slice(1)
+    const candidate = withPointer(rest, recycled.length, req.pointerFor, stalePointer)
+    const verdict = budgetOf(candidate)
+    if (verdict.allowed && fallback === null) {
+      fallback = { inner: candidate, count: recycled.length } // 放得下的**最少**迁移量
+    }
+    if (verdict.headroom >= reserve) {
+      chosen = candidate
+      stopped = 'fits'
+      break
+    }
+  }
+  if (chosen === null && fallback !== null) {
+    chosen = fallback.inner
+    recycled.splice(fallback.count) // 回到「最少迁移量」——不为没达到的目标白迁条目
+    stopped = 'tight'
+  }
+  if (chosen === null) return { outcome: direct, recycled: [], stopped }
+
+  const next = spliceBlock(full, chosen, block)
+  const verdict = checkBudget(next, req.maxBytes)
+  if (!verdict.allowed) return { outcome: direct, recycled: [], stopped } // 双保险：放行前再裁一次
+  return {
+    outcome: { ok: true, action: 'added', content: next, bytes: verdict.bytes, headroom: verdict.headroom },
+    recycled,
+    stopped,
+  }
 }
