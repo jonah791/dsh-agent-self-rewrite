@@ -1,6 +1,49 @@
 /** 跨代自评估进化插件 —— 共享类型。 */
 export type ResourceId = 'agent-rules' | 'candidate-prompt' | 'composition'
 
+/**
+ * 全部合法资源 id（**运行时真源**，与 `ResourceId` 联合类型同处声明——加资源只改这里）。
+ *
+ * 存在理由：工具层收到的是 `string`，校验它需要运行时可枚举的值；`ResourceId` 是类型，
+ * 编译后不存在。两份声明放同一处，是为了让「加了类型却忘了运行时」在**同一屏**可见。
+ */
+export const RESOURCE_IDS: readonly ResourceId[] = ['agent-rules', 'candidate-prompt', 'composition']
+
+/**
+ * 落点模式：
+ * - `block` —— 写进受管文件的**标记段**（走 `applyBlockSet`，有预算裁决）
+ * - `file` —— **整文件覆盖**（无预算裁决：它不是注入面）
+ */
+export type SinkMode = 'block' | 'file'
+
+/**
+ * 一个资源的落点（「它写到哪里去」的声明）。
+ *
+ * 判别联合是刻意的：`block` 必有 `blockId` 与**数值**上限，`file` 必**无上限**——
+ * 「无上限」用 `null` 而不是 `0`（`0` 是「上限为零字节」，两者不是一回事）。
+ */
+export type ResourceSink =
+  | {
+    readonly id: ResourceId
+    /** 绝对路径 */
+    readonly path: string
+    readonly mode: 'block'
+    /** 标记段 id（`MANAGED_BLOCKS` 里的登记名） */
+    readonly blockId: string
+    readonly maxBytes: number
+    /** 要写进段内的文本 */
+    readonly content: string
+  }
+  | {
+    readonly id: ResourceId
+    readonly path: string
+    readonly mode: 'file'
+    /** **无上限**（`null` ≠ `0`） */
+    readonly maxBytes: null
+    /** 要整文件写入的文本 */
+    readonly content: string
+  }
+
 export interface ResourceVersion {
   /** 版本号（v0.0 起） */
   version: string

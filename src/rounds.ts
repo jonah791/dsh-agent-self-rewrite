@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { EvolveStore } from './ledger-store.js'
-import type { Ledger, ResourceId } from './types.js'
+import type { Ledger, ResourceId, ResourceSink } from './types.js'
 import { renderPreset } from './presets.js'
 import { runFullEval } from './evaluator.js'
 import {
@@ -38,6 +38,65 @@ import { MANAGED_BLOCKS } from './wiring.js'
 
 export const RULES_BLOCK_ID = 'evolve'
 export const RULES_FILE = 'AGENTS.md'
+/** 候选任务说明书的文件名（落点表与 `initLedger` **共用这一个常量**，不各写一份字面量） */
+export const CANDIDATE_PROMPT_FILE = 'CANDIDATE_PROMPT.md'
+
+/** 落点解析所需的环境（路径由调用方解析后注入——本模块不读环境变量、不拼 DSH_HOME） */
+export interface SinkEnv {
+  /** 受管规则文件的**绝对路径**（调用方用 `resolveRulesPath` 解析） */
+  readonly rulesPath: string
+  /** modeltest 工作目录（候选任务说明书的家） */
+  readonly modeltestDir: string
+  /** 规则标记段的字节上限 */
+  readonly maxBytes: number
+}
+
+/**
+ * 有落点的资源（**顺序即声明顺序**）。
+ *
+ * ⚠ `composition` **不在其中**——理由见 `sinkOf` 注释（它是「已声明未实现」，给它落点会造出第二写者）。
+ * 本常量是「哪些资源会写盘」的单一真源：落盘分派、状态读数、回滚遍历都读它。
+ */
+export const SINK_RESOURCE_IDS: readonly ResourceId[] = ['agent-rules', 'candidate-prompt']
+
+/**
+ * 落点表（**单一真源**）：每个资源「写到哪里、怎么写、有没有上限」只在这里声明一次。
+ *
+ * | 资源 | 落点 | 模式 | 上限 |
+ * |---|---|---|---|
+ * | `agent-rules` | `env.rulesPath` | `block`（标记段 `evolve`，走 `applyBlockSet` 预算裁决） | `env.maxBytes` |
+ * | `candidate-prompt` | `<modeltestDir>/CANDIDATE_PROMPT.md` | `file`（整文件覆盖） | `null`（不是注入面，无预算） |
+ * | `composition` | **不注册** | — | — |
+ *
+ * ⚠ `composition` 为何不注册：`ResourceId` 声明了它，但账本里它**连基线版本都没有**
+ * （`initLedger` 只注册前两个），且渲染真源是 `ledger.compositionSource`（**另一个字段**）
+ * ⇒ 编辑 `resources['composition']` 对实际渲染**零影响**。这是「已声明未实现」，不是
+ * 「可写但没落点」——给它一个落点等于造出**第二个写者**（§5.19）。
+ *
+ * 返回 `null` 的语义 = **无落点**：调用方必须如实告知「账本变了、盘上没变」，不许静默。
+ */
+export function sinkOf(env: SinkEnv, resource: ResourceId, content: string): ResourceSink | null {
+  if (resource === 'agent-rules') {
+    return {
+      id: resource,
+      path: env.rulesPath,
+      mode: 'block',
+      blockId: RULES_BLOCK_ID,
+      maxBytes: env.maxBytes,
+      content,
+    }
+  }
+  if (resource === 'candidate-prompt') {
+    return {
+      id: resource,
+      path: join(env.modeltestDir, CANDIDATE_PROMPT_FILE),
+      mode: 'file',
+      maxBytes: null,
+      content,
+    }
+  }
+  return null
+}
 
 export interface RoundConfig {
   readonly modeltestDir: string
@@ -99,7 +158,7 @@ export function initLedger(store: EvolveStore, config: RoundConfig): InitResult 
   const rulesPath = join(config.workspaceDir, RULES_FILE)
   const rulesText = existsSync(rulesPath) ? extractRules(readFileSync(rulesPath, 'utf8')) : ''
   store.addVersion(l, 'agent-rules', rulesText, 'v0.0 基线：本体规则段')
-  const cpPath = join(config.modeltestDir, 'CANDIDATE_PROMPT.md')
+  const cpPath = join(config.modeltestDir, CANDIDATE_PROMPT_FILE)
   const cpText = existsSync(cpPath) ? readFileSync(cpPath, 'utf8') : ''
   store.addVersion(l, 'candidate-prompt', cpText, 'v0.0 基线：modeltest 任务说明书')
   for (const id of ['agent-rules', 'candidate-prompt'] as ResourceId[]) {
@@ -120,13 +179,19 @@ export function initLedger(store: EvolveStore, config: RoundConfig): InitResult 
 export interface EditResult {
   readonly version: string
   readonly diff: unknown
-  /** 资源是否为 `agent-rules`（true 时调用方必须把新内容经唯一写原语落盘） */
-  readonly needsDiskWrite: boolean
-  readonly rulesContent: string
+  /**
+   * 落点（`null` = **无落点**：账本版本已产生、盘上不会变）。
+   *
+   * 旧版这里是 `needsDiskWrite: boolean` + `rulesContent: string`，两个缺陷：
+   * ① boolean 表达不了「哪个资源、写到哪、怎么写」——多资源下 `true` 不知道写谁；
+   * ② `rulesContent` 恒取 `agent-rules` 的文本（**编辑 candidate-prompt 时也返回它**）
+   * ⇒ 即使照着写，写进去的也是**另一个资源的内容**。落点自带 `content`，这两条一起消失。
+   */
+  readonly sink: ResourceSink | null
 }
 
-/** 编辑资源：新版本 + diff 留痕；**不落盘**（落盘归调用方，走唯一写原语） */
-export function editResource(store: EvolveStore, resource: ResourceId, newContent: string, note: string): EditResult {
+/** 编辑资源：新版本 + diff 留痕；**不落盘**（落盘归调用方，按返回的 `sink` 走唯一写原语） */
+export function editResource(store: EvolveStore, env: SinkEnv, resource: ResourceId, newContent: string, note: string): EditResult {
   const l = store.ensureLedger()
   const version = store.addVersion(l, resource, newContent, note)
   l.active[resource] = version
@@ -135,8 +200,9 @@ export function editResource(store: EvolveStore, resource: ResourceId, newConten
   return {
     version,
     diff: v?.diff ?? { added: 0, removed: 0, newLength: 0 },
-    needsDiskWrite: resource === 'agent-rules',
-    rulesContent: store.contentOf(l, 'agent-rules'),
+    // 落点内容取**本次编辑的文本**（不是 `contentOf`——那取的是账本里「当前生效」的版本，
+    // 对 `agent-rules` 恰好相同，对别的资源就是错的）
+    sink: sinkOf(env, resource, newContent),
   }
 }
 
@@ -144,26 +210,47 @@ export interface CommitResult {
   readonly action: 'commit' | 'rollback'
   readonly anchor: string
   readonly rollbackFrom?: string
-  /** 回滚是否需要重写盘上规则段（版本变了） */
-  readonly needsDiskWrite: boolean
+  /**
+   * 需要重写盘上的落点（版本变了）——**每个资源一个**。
+   *
+   * 旧版是单个 `needsDiskWrite: boolean`：它只能表达「有东西要写」，表达不了「写哪个」
+   * ⇒ 多资源下这个 boolean 是**有损**的（回滚 candidate-prompt 时无从落盘）。
+   */
+  readonly sinks: readonly ResourceSink[]
 }
 
-/** 提交（浮动版本成为锚点）或回滚（回到最近锚点，不产生新版本号） */
-export function commitOrRollback(store: EvolveStore, rollback: boolean, note: string): CommitResult {
+/**
+ * 提交（浮动版本成为锚点）或回滚（回到最近锚点，不产生新版本号）。
+ *
+ * 回滚**遍历落点表**——旧版硬编码 `agent-rules`：其余资源的浮动版本被删了却没人通知盘上
+ * ⇒ 账本与盘上静默漂移（P1 修的正是这条）。
+ */
+export function commitOrRollback(store: EvolveStore, env: SinkEnv, rollback: boolean, note: string): CommitResult {
   const l = store.ensureLedger()
   if (rollback) {
-    const res = l.resources['agent-rules']
-    const anchor = res?.anchors.at(-1)
-    const active = l.active['agent-rules']
-    if (res !== undefined && anchor !== undefined && active !== undefined && active !== anchor) {
-      l.rollbacks.push({ at: new Date().toISOString(), fromVersion: active, toVersion: anchor, note })
-      delete l.active['agent-rules']
-      store.writeLedger(l)
-      return { action: 'rollback', anchor, rollbackFrom: active, needsDiskWrite: true }
+    const sinks: ResourceSink[] = []
+    let anchor = 'v0.0'
+    let rollbackFrom: string | undefined
+    for (const id of SINK_RESOURCE_IDS) {
+      const res = l.resources[id]
+      const latestAnchor = res?.anchors.at(-1)
+      const active = l.active[id]
+      if (res === undefined || latestAnchor === undefined || active === undefined || active === latestAnchor) continue
+      l.rollbacks.push({ at: new Date().toISOString(), fromVersion: active, toVersion: latestAnchor, note })
+      delete l.active[id]
+      const sink = sinkOf(env, id, store.contentOf(l, id))
+      if (sink !== null) sinks.push(sink)
+      // `anchor` / `rollbackFrom` 报**规则资源**那一份（它是主锚点）；其余资源的版本由
+      // 各自的 `sinks[].id` 指认——把两条资源的版本混成一个数就是口径失真。
+      if (id === 'agent-rules') {
+        anchor = latestAnchor
+        rollbackFrom = active
+      }
     }
-    return { action: 'rollback', anchor: anchor ?? 'v0.0', ...(active !== undefined ? { rollbackFrom: active } : {}), needsDiskWrite: false }
+    store.writeLedger(l)
+    return { action: 'rollback', anchor, ...(rollbackFrom !== undefined ? { rollbackFrom } : {}), sinks }
   }
-  for (const id of ['agent-rules', 'candidate-prompt'] as ResourceId[]) {
+  for (const id of SINK_RESOURCE_IDS) {
     const res = l.resources[id]
     if (res === undefined) continue
     const active = l.active[id]
@@ -173,7 +260,7 @@ export function commitOrRollback(store: EvolveStore, rollback: boolean, note: st
     }
   }
   store.writeLedger(l)
-  return { action: 'commit', anchor: l.resources['agent-rules']?.anchors.at(-1) ?? 'v0.0', needsDiskWrite: false }
+  return { action: 'commit', anchor: l.resources['agent-rules']?.anchors.at(-1) ?? 'v0.0', sinks: [] }
 }
 
 export interface RoundStartResult {

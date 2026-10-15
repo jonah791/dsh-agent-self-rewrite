@@ -28,11 +28,11 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { EvolveStore } from './ledger-store.js'
-import type { ResourceId } from './types.js'
+import { RESOURCE_IDS, type ResourceId, type ResourceSink } from './types.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
-import { buildStatus, selfRewriteSnapshot, type SelfRewriteSnapshot } from './status.js'
-import { applyBlockSet, applyRuleUpsertWithRecycle, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
+import { buildStatus, selfRewriteSnapshot, type ArtifactStat, type SelfRewriteSnapshot } from './status.js'
+import { applyBlockSet, applyRuleUpsertWithRecycle, byteLength, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
 import {
   addHypothesis,
   applyVerdict,
@@ -46,8 +46,8 @@ import {
 } from './hypotheses.js'
 import { createProbeEngine, readLifeLogLines } from './probes.js'
 import {
-  RULES_BLOCK_ID,
   RULES_FILE,
+  SINK_RESOURCE_IDS,
   assertWorkspaceReady,
   buildTaskPrompt,
   commitOrRollback,
@@ -59,9 +59,11 @@ import {
   makeChildScanner,
   reapRuns,
   recordRun,
+  sinkOf,
   startRound,
   submitRun,
   type RoundConfig,
+  type SinkEnv,
 } from './rounds.js'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -155,11 +157,16 @@ export function resolveRulesPath(config: Config, dshHome: string): string {
   return join(root, named)
 }
 
-/** 读受管文件字节数：**不存在 ⇒ `null`**（与「0 字节」严格区分） */
-export function readRulesBytes(rulesPath: string): number | null {
-  if (!existsSync(rulesPath)) return null
+/**
+ * 读文件字节数：**不存在 ⇒ `null`**（与「0 字节」严格区分）。
+ *
+ * 名字不带 `Rules` 是刻意的——它对**任意**路径都工作（落点表里每个资源都靠它取读数）；
+ * 旧名 `readRulesBytes` 会让人以为它只读 `AGENTS.md`。
+ */
+export function readBytes(filePath: string): number | null {
+  if (!existsSync(filePath)) return null
   try {
-    return readFileSync(rulesPath).length
+    return readFileSync(filePath).length
   } catch {
     return null
   }
@@ -172,20 +179,27 @@ function isMainAgent(agent: unknown): boolean {
   return depth === undefined || depth === 0
 }
 
-/** 写盘（备份 + tmp + rename）；**只有 `ok: true` 才允许调用** */
-function commitRulesWrite(rulesPath: string, content: string, backupDir: string): void {
+/**
+ * 写盘（备份 + tmp + rename）；**只有 `ok: true` 才允许调用**。
+ *
+ * 名字不带 `Rules`：它是**通用整文件写原语**（原子替换 + best-effort 备份）——
+ * `block` 落点写完段后的整文件、`file` 落点的整文件都走它。备份名取**原名**，
+ * 便于事后分辨备份的是哪份文件（旧版硬编码 `AGENTS.md.bak-`，写第二份文件时会误标）。
+ */
+function commitFileWrite(filePath: string, content: string, backupDir: string): void {
   try {
-    if (existsSync(rulesPath)) {
+    if (existsSync(filePath)) {
       mkdirSync(backupDir, { recursive: true })
-      const bak = join(backupDir, 'AGENTS.md.bak-' + new Date().toISOString().replace(/[:.]/g, '-'))
-      writeFileSync(bak, readFileSync(rulesPath, 'utf8'), 'utf8')
+      const base = filePath.split(/[\\/]/).pop() ?? 'file'
+      const bak = join(backupDir, base + '.bak-' + new Date().toISOString().replace(/[:.]/g, '-'))
+      writeFileSync(bak, readFileSync(filePath, 'utf8'), 'utf8')
     }
   } catch {
     /* 备份是 best-effort：checkpoint 是主安全网 */
   }
-  const tmp = rulesPath + '.tmp'
+  const tmp = filePath + '.tmp'
   writeFileSync(tmp, content, 'utf8')
-  renameSync(tmp, rulesPath)
+  renameSync(tmp, filePath)
 }
 
 /** 写入结果的呈现文本（added / exists / replaced / 四类拒绝都当场可见） */
@@ -195,6 +209,39 @@ function describeWrite(outcome: WriteOutcome): string {
     return (outcome.action === 'replaced' ? '已替换块内容' : '已新增 1 条') + '（余量 ' + String(outcome.headroom) + ' 字节）'
   }
   return '未写入：' + outcome.reason + '——' + outcome.detail
+}
+
+/**
+ * 按落点写盘（**唯一写原语的唯一调用点**）——`block` 走标记段 + 预算裁决，`file` 走整文件。
+ *
+ * 导出是为了可离线测（薄 I/O 层，不依赖插件上下文）：判据是「盘上文件真的变了」，
+ * 这条判据只能对真实文件系统断言。
+ */
+export function applySink(sink: ResourceSink, backupDir: string): string {
+  if (sink.mode === 'block') {
+    const full = existsSync(sink.path) ? readFileSync(sink.path, 'utf8') : ''
+    const write = applyBlockSet(full, { blockId: sink.blockId, inner: sink.content, maxBytes: sink.maxBytes })
+    if (write.ok) commitFileWrite(sink.path, write.content, backupDir)
+    return describeWrite(write)
+  }
+  commitFileWrite(sink.path, sink.content, backupDir)
+  return '已整文件写入（' + String(byteLength(sink.content)) + ' 字节；**无预算裁决**——它不是注入面）'
+}
+
+/**
+ * 落点表 → 预算读数（**遍历落点表**，不硬编码资源名——加资源时这里自动跟上）。
+ *
+ * `sinkOf(env, id, '')` 只取路径与上限：读数不关心内容（传空串是刻意的——
+ * 免得为了报字节数把整份文件内容读进内存）。
+ */
+export function artifactsOf(env: SinkEnv): ArtifactStat[] {
+  const out: ArtifactStat[] = []
+  for (const id of SINK_RESOURCE_IDS) {
+    const sink = sinkOf(env, id, '')
+    if (sink === null) continue
+    out.push({ id, path: sink.path, bytes: readBytes(sink.path), maxBytes: sink.maxBytes })
+  }
+  return out
 }
 
 /**
@@ -287,6 +334,12 @@ export function apply(ctx: Context, config: Config): void {
     pythonBin: config.pythonBin,
     evalTimeoutMs: config.evalTimeoutMs,
   }
+  /** 落点解析环境（**唯一构造点**）：路径在这里解析一次，落点表只消费结果 */
+  const sinkEnv: SinkEnv = {
+    rulesPath,
+    modeltestDir: config.modeltestDir,
+    maxBytes: config.maxBytes,
+  }
   const store = new EvolveStore(paths.evolveDir, config.modeltestDir, '', '')
 
   const resolveParentAgent = (): Agent => {
@@ -342,7 +395,7 @@ export function apply(ctx: Context, config: Config): void {
         selfTest: loadSelfTestState(paths),
         ledger: loadLedger(paths),
         runs: listRuns(paths),
-        rules: { path: rulesPath, bytes: readRulesBytes(rulesPath), maxBytes: config.maxBytes },
+        artifacts: artifactsOf(sinkEnv),
       }, new Date())
       const lines = [report.text]
       const state = loadSelfTestState(paths)
@@ -550,7 +603,7 @@ export function apply(ctx: Context, config: Config): void {
         if (write.outcome.ok && write.outcome.action !== 'exists') {
           // 顺序是刻意的：**先归档、后写段**——归档失败时段还没动，状态一致（§5.6）
           if (write.recycled.length > 0) appendArchive(archivePath, write.recycled, config.rulesBlockId)
-          commitRulesWrite(rulesPath, write.outcome.content, backupsDir(paths))
+          commitFileWrite(rulesPath, write.outcome.content, backupsDir(paths))
         }
         wired = '\n布线：' + describeRecycle(write, relArchive)
       }
@@ -650,10 +703,10 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ⑤ rewrite_commit ----------
   ctx.tools.register(tool({
     name: 'rewrite_commit',
-    description: '资源与锚点：action=edit 写新版本（agent-rules 会经唯一写原语落盘 + 预算裁决）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号）。',
+    description: '资源与锚点：action=edit 写新版本（**按落点落盘**——agent-rules 走标记段 + 预算裁决，candidate-prompt 走整文件）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号，**遍历全部落点**）。无落点的资源（composition）会**如实报「未写盘」**，不静默漂移。',
     parameters: {
       action: { type: 'string', required: true, description: 'edit | commit | rollback' },
-      resource: { type: 'string', description: 'edit：agent-rules | candidate-prompt' },
+      resource: { type: 'string', description: 'edit：agent-rules | candidate-prompt（composition 无落点，会报未写盘）' },
       newContent: { type: 'string', description: 'edit：新内容全文' },
       note: { type: 'string', description: '说明' },
     },
@@ -662,28 +715,35 @@ export function apply(ctx: Context, config: Config): void {
       const action = args.action.trim()
       if (action === 'edit') {
         if (args.resource === undefined || args.newContent === undefined) return { text: 'edit 需要 resource 与 newContent' }
-        const r = editResource(store, args.resource as ResourceId, args.newContent, args.note ?? '')
-        let wired = ''
-        if (r.needsDiskWrite) {
-          const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
-          const write = applyBlockSet(full, { blockId: RULES_BLOCK_ID, inner: r.rulesContent, maxBytes: config.maxBytes })
-          if (write.ok) commitRulesWrite(rulesPath, write.content, backupsDir(paths))
-          wired = '\n落盘：' + describeWrite(write)
+        const rid = args.resource.trim()
+        // 运行时校验（`ResourceId` 是类型，编译后不存在）：未知资源**当场拒绝**，
+        // 不许 `as ResourceId` 硬转——那会让 `addVersion` 在账本里造出一个幽灵资源。
+        if (!RESOURCE_IDS.includes(rid as ResourceId)) {
+          return { text: '未知资源：' + rid + '（可用：' + RESOURCE_IDS.join(' | ') + '）' }
+        }
+        const r = editResource(store, sinkEnv, rid as ResourceId, args.newContent, args.note ?? '')
+        let wired: string
+        if (r.sink !== null) {
+          wired = '\n落盘：' + applySink(r.sink, backupsDir(paths))
+        } else {
+          // **如实告知**：账本版本已产生、盘上不会变。静默通过才是缺陷（P1 修的正是这个形态）。
+          wired = '\n落盘：**未写盘**——资源 `' + rid + '` 无落点（账本版本 ' + r.version
+            + ' 已产生，盘上不变）。它不是「已实现但没写」，是**未实现**：给它落点会造出第二个写者。'
         }
         const d = r.diff as { added?: number; removed?: number }
         return { text: '编辑完成：' + r.version + '（diff +' + String(d.added ?? 0) + '/-' + String(d.removed ?? 0) + ' 行）' + wired }
       }
       if (action === 'commit') {
-        const r = commitOrRollback(store, false, args.note ?? '')
+        const r = commitOrRollback(store, sinkEnv, false, args.note ?? '')
         return { text: '已提交，新锚点 ' + r.anchor }
       }
       if (action === 'rollback') {
-        const r = commitOrRollback(store, true, args.note ?? '')
-        if (r.needsDiskWrite) {
-          const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
-          const write = applyBlockSet(full, { blockId: RULES_BLOCK_ID, inner: store.contentOf(store.ensureLedger(), 'agent-rules'), maxBytes: config.maxBytes })
-          if (write.ok) commitRulesWrite(rulesPath, write.content, backupsDir(paths))
-          return { text: '已回滚到锚点 ' + r.anchor + '（原 ' + String(r.rollbackFrom ?? '') + '）\n落盘：' + describeWrite(write) }
+        const r = commitOrRollback(store, sinkEnv, true, args.note ?? '')
+        if (r.sinks.length > 0) {
+          const done = r.sinks.map((s) => '  [' + s.id + '] ' + applySink(s, backupsDir(paths)))
+          return {
+            text: '已回滚到锚点 ' + r.anchor + '（原 ' + String(r.rollbackFrom ?? '') + '）\n落盘：\n' + done.join('\n'),
+          }
         }
         return { text: '已回滚到锚点 ' + r.anchor + '（无可回滚的浮动版本）' }
       }

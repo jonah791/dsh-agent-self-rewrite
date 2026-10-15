@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { Config, apply, inject, name, readRulesBytes, resolveDshHome, resolveRulesPath } from '../lib/index.js'
+import { Config, apply, inject, name, readBytes, resolveDshHome, resolveRulesPath } from '../lib/index.js'
 
 test('模块加载：导出形状完整（name 与 cordis.patch.yml 的 id 对齐、inject 含 tools、apply 是函数）', () => {
   assert.equal(name, 'agent-self-rewrite')
@@ -34,16 +34,16 @@ test('resolveRulesPath：含分隔符视为路径本身；否则落 workspaceDir
   assert.equal(dirname('E:/alice/.dsh'), 'E:/alice')
 })
 
-test('尸体：受管文件不存在 ⇒ readRulesBytes 返回 null（**不是 0**）', () => {
-  assert.equal(readRulesBytes('E:/definitely/not/here/AGENTS.md'), null)
+test('尸体：受管文件不存在 ⇒ readBytes 返回 null（**不是 0**）', () => {
+  assert.equal(readBytes('E:/definitely/not/here/AGENTS.md'), null)
 })
 
-test('readRulesBytes：文件存在 ⇒ 返回真实字节数（用临时夹具，不碰生产文件）', () => {
+test('readBytes：文件存在 ⇒ 返回真实字节数（用临时夹具，不碰生产文件）', () => {
   const root = mkdtempSync(join(tmpdir(), 'selfrewrite-idx-'))
   try {
     const f = join(root, 'AGENTS.md')
     writeFileSync(f, '中文abc', 'utf8')
-    assert.equal(readRulesBytes(f), 9) // 中文 6 字节 + abc 3 字节
+    assert.equal(readBytes(f), 9) // 中文 6 字节 + abc 3 字节
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

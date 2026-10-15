@@ -22,13 +22,33 @@ import {
   type SelfTestState,
 } from './store.js'
 
+/**
+ * 一个受管产物的预算读数。
+ *
+ * 两个 `null` 各有独立语义，**都不是 0**：
+ * - `bytes: null` —— **文件不存在**（首次写入会新建；「不存在」≠「零字节」）
+ * - `maxBytes: null` —— **无上限**（它不是注入面，没有预算裁决；「无上限」≠「上限为零」）
+ */
+export interface ArtifactStat {
+  /** 资源 id（`agent-rules` / `candidate-prompt` / …） */
+  readonly id: string
+  readonly path: string
+  readonly bytes: number | null
+  readonly maxBytes: number | null
+}
+
 export interface StatusInput {
   readonly selfTest: ReadOutcome<SelfTestState>
   readonly ledger: ReadOutcome<Ledger>
   /** run **记录**（目录里的全部，不只是未收尾的）—— 含 `status`，供如实分解 */
   readonly runs: readonly RunRecord[]
-  /** 受管文件的预算读数：`bytes: null` 表示**文件不存在**（与「0 字节」是两件事） */
-  readonly rules?: { readonly path: string; readonly bytes: number | null; readonly maxBytes: number }
+  /**
+   * 受管产物的预算读数（**每条一个落点**）。
+   *
+   * 旧版是单个 `rules?: {path,bytes,maxBytes}`——只报一条，多落点下其余**静默不可见**
+   * （本工具存在的理由就是「一条命令看全」，看不见的那条等于没被管）。
+   */
+  readonly artifacts?: readonly ArtifactStat[]
 }
 
 export interface StatusCounts {
@@ -522,13 +542,17 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
 
   const anchorText = anchors === null ? '未知（账本不可读）' : String(anchors)
   const lines = ['自改写引擎 · 状态']
-  if (input.rules !== undefined) {
-    const r = input.rules
-    lines.push(
-      r.bytes === null
-        ? `受管文件：${r.path}（**不存在**——首次写入会追加标记段；此处的「不存在」不等于零字节）`
-        : `受管文件：${r.path}（${r.bytes} 字节 / 上限 ${r.maxBytes}，余量 ${r.maxBytes - r.bytes}）`,
-    )
+  if (input.artifacts !== undefined) {
+    for (const a of input.artifacts) {
+      // 三态**互不掩盖**：不存在 / 无上限 / 有预算各有自己的句子（合并会把语义压掉）
+      if (a.bytes === null) {
+        lines.push(`受管产物 [${a.id}]：${a.path}（**不存在**——首次写入会新建；此处的「不存在」不等于零字节）`)
+      } else if (a.maxBytes === null) {
+        lines.push(`受管产物 [${a.id}]：${a.path}（${a.bytes} 字节 / **无上限**——它不是注入面，无预算裁决）`)
+      } else {
+        lines.push(`受管产物 [${a.id}]：${a.path}（${a.bytes} 字节 / 上限 ${a.maxBytes}，余量 ${a.maxBytes - a.bytes}）`)
+      }
+    }
   }
   lines.push(
     `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / archived ${base.archived} / pending ${base.pending}${base.other ? ` / other ${base.other}` : ''}）`,

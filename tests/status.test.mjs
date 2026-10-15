@@ -55,14 +55,14 @@ test('尸体：账本读不到 ⇒ 锚点报「未知」，文本里**不得出�
   assert.ok(r.text.includes('锚点：未知（账本不可读）'))
 })
 
-test('尸体：受管文件不存在 ⇒ 预算行报「不存在」，**不报 0 字节**', () => {
+test('尸体：受管产物不存在 ⇒ 预算行报「不存在」，**不报 0 字节**', () => {
   const r = buildStatus({
     selfTest: ok({ hypotheses: [] }),
     ledger: ok({ resources: {} }),
     runs: [],
-    rules: { path: 'E:/nope/AGENTS.md', bytes: null, maxBytes: 64800 },
+    artifacts: [{ id: 'agent-rules', path: 'E:/nope/AGENTS.md', bytes: null, maxBytes: 64800 }],
   })
-  const line = r.text.split('\n').find((l) => l.startsWith('受管文件：'))
+  const line = r.text.split('\n').find((l) => l.startsWith('受管产物 ['))
   assert.ok(line !== undefined && line.includes('不存在'))
   assert.ok(!/\d+ 字节/.test(line), '预算行不得渲染任何字节数字（值的位置上不许出现 0）')
 })
@@ -72,9 +72,48 @@ test('预算行：文件存在 ⇒ 报字节数、上限与余量', () => {
     selfTest: ok({ hypotheses: [] }),
     ledger: ok({ resources: {} }),
     runs: [],
-    rules: { path: 'E:/x/AGENTS.md', bytes: 64434, maxBytes: 64800 },
+    artifacts: [{ id: 'agent-rules', path: 'E:/x/AGENTS.md', bytes: 64434, maxBytes: 64800 }],
   })
   assert.ok(r.text.includes('64434 字节 / 上限 64800，余量 366'))
+})
+
+test('预算行：**无上限**的产物报「无上限」，不报「上限 0」也不报余量', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+    artifacts: [{ id: 'candidate-prompt', path: 'E:/x/CANDIDATE_PROMPT.md', bytes: 1234, maxBytes: null }],
+  })
+  const line = r.text.split('\n').find((l) => l.startsWith('受管产物 [candidate-prompt]'))
+  assert.ok(line !== undefined && line.includes('无上限'))
+  assert.ok(!line.includes('上限 0'), '「无上限」不得渲染成「上限 0」——那是两个意思')
+  assert.ok(!line.includes('余量'), '无上限就没有余量可言')
+})
+
+test('多产物：**每条落点各一行**（旧版只报一条，其余静默不可见）', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+    artifacts: [
+      { id: 'agent-rules', path: 'E:/x/AGENTS.md', bytes: 100, maxBytes: 200 },
+      { id: 'candidate-prompt', path: 'E:/x/CANDIDATE_PROMPT.md', bytes: 50, maxBytes: null },
+    ],
+  })
+  const rows = r.text.split('\n').filter((l) => l.startsWith('受管产物 ['))
+  assert.equal(rows.length, 2, '两条落点必须各占一行——少一行就是静默不可见')
+  assert.ok(rows[0].includes('[agent-rules]'))
+  assert.ok(rows[1].includes('[candidate-prompt]'))
+})
+
+test('尸体：旧字段 `rules` 已退役 —— 传它**不产生任何预算行**（两个字段都读 = 双源）', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+    rules: { path: 'E:/x/AGENTS.md', bytes: 100, maxBytes: 200 },
+  })
+  assert.equal(r.text.split('\n').filter((l) => l.startsWith('受管产物 [')).length, 0)
 })
 
 test('空假设库 ⇒ 明说「猜想环当前无内容」，而不是沉默', () => {
