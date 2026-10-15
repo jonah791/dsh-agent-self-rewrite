@@ -521,7 +521,8 @@ export function apply(ctx: Context, config: Config): void {
         text: '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status
           + '（证据 ' + String(outcome.hypothesis.evidence.length) + ' 条；方向 ' + outcome.direction.direction + '）'
           + wired
-          + (outcome.polarityWarning !== null ? '\n' + outcome.polarityWarning : ''),
+          + (outcome.polarityWarning !== null ? '\n' + outcome.polarityWarning : '')
+          + (outcome.emptyRefuteWarning !== null ? '\n' + outcome.emptyRefuteWarning : ''),
       }
     },
   }))

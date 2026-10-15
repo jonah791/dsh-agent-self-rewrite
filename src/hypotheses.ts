@@ -163,6 +163,15 @@ export interface VerdictOutcome {
   readonly direction: DirectionReport
   /** 裁决动作与证据方向相悖时的护栏提示（**只提示不阻断**，决策权归主体） */
   readonly polarityWarning: string | null
+  /**
+   * `refute` 但**零证据**时的护栏提示（**只提示不阻断**）。
+   *
+   * `refuted` 的语义是「**被证伪**」，要求反对证据 ≥1 条；零证据的淘汰（重复项 / 探针不可证伪 /
+   * 无独立价值）正确落点是 `archived`（`rewrite_hypothesis action=archive`）。
+   * 判据来源（2026-10-15 · t-29233235）：全库核对 6 条「零证据 + refuted」的 resolution，
+   * **逐条都是淘汰语义**，没有一条是「被证伪」⇒ 两者同貌会让信号面说谎。
+   */
+  readonly emptyRefuteWarning: string | null
   /** confirm 且给了 ruleDraft 时为 true——由调用方执行布线（本模块不写 AGENTS.md） */
   readonly needsWiring: boolean
 }
@@ -182,9 +191,22 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
         ? '若主张本就该被证伪（「我不会 X」型），正确动作通常是 refute 或 refine（改写断言后重新采证）。'
         : '若已确认要逆方向裁定，请在 resolution 写明理由（本次已照办）。')
   }
+  // 零证据 refute 护栏（t-29233235）：refuted = 「被证伪」需要反对证据；零证据的淘汰该走 archived。
+  // **不阻断**——「零证据也要记成被证伪」可能是刻意的，护栏只要求它在 resolution 里说清证据来源。
+  const emptyRefuteWarning: string | null =
+    input.verdict === 'refute' && h.evidence.length === 0
+      ? '⚠ 护栏提示：本条**零证据**，而 `refuted` 的语义是「被证伪」（要求反对证据 ≥1 条）。'
+        + '零证据的淘汰（重复项 / 探针不可证伪 / 无独立价值）正确落点是 `archived`——'
+        + '用 `rewrite_hypothesis action=archive`。若确实要记成被证伪，请在 resolution 写明证据来源。'
+      : null
   h.updatedAt = now.toISOString()
   if (input.polarity !== undefined) h.probe.polarity = input.polarity
-  const note = (base: string): string => (polarityWarning === null ? base : base + ' ｜ ' + polarityWarning)
+  const note = (base: string): string => {
+    const parts = [base]
+    if (polarityWarning !== null) parts.push(polarityWarning)
+    if (emptyRefuteWarning !== null) parts.push(emptyRefuteWarning)
+    return parts.join(' ｜ ')
+  }
 
   let needsWiring = false
   if (input.verdict === 'confirm') {
@@ -202,7 +224,7 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
     h.evidence = [] // 重新采证
     h.resolution = input.resolution ?? 'refined, re-collecting evidence'
   }
-  return { hypothesis: h, direction, polarityWarning, needsWiring }
+  return { hypothesis: h, direction, polarityWarning, emptyRefuteWarning, needsWiring }
 }
 
 export interface FulfillInput {

@@ -117,6 +117,26 @@ test('applyVerdict：refine 清空旧证据并回到 active', () => {
   assert.equal(h.threshold, 4)
 })
 
+test('applyVerdict：refute 但零证据 ⇒ 护栏提示（refuted 语义是「被证伪」，要求反对证据）', () => {
+  const state = { hypotheses: [] }
+  const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
+  const out = applyVerdict(state, { id: h.id, verdict: 'refute', resolution: '与既有假设重复，淘汰' })
+  assert.equal(out.hypothesis.status, 'refuted')
+  assert.equal(typeof out.emptyRefuteWarning, 'string', '零证据 refute 必须有护栏提示（断言类型：字段缺失成 undefined 时也不放过）')
+  assert.match(out.emptyRefuteWarning, /零证据/)
+  assert.match(out.emptyRefuteWarning, /archived/)
+  assert.ok(out.hypothesis.resolution.includes('零证据'), '护栏提示必须进 resolution 留痕（否则下一次只看到 refuted）')
+})
+
+test('对照组：refute 且**有**证据 ⇒ 无护栏提示（判据不误伤正常裁决）', () => {
+  const state = { hypotheses: [] }
+  const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
+  recordEvidence(h, { ts: 't', kind: 'read-repeat', detail: { verdict: 'violated' } })
+  const out = applyVerdict(state, { id: h.id, verdict: 'refute' })
+  assert.equal(out.emptyRefuteWarning, null)
+  assert.ok(!out.hypothesis.resolution.includes('零证据'))
+})
+
 test('enrich：confirmed 但方向非纯支持 ⇒ 标极性存疑（待复核指纹）', () => {
   const state = { hypotheses: [] }
   const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
