@@ -420,7 +420,7 @@ export function listOrphans(store: EvolveStore, graceFactor: number): string[] {
   return findOrphans(store.listRuns(), Date.now(), graceFactor).map(describeOrphan)
 }
 
-/** 账本瘦身视图（代 / 活跃版本 / 锚点链 / 撤回记录） */
+/** 账本瘦身视图（代 / 活跃版本 / 锚点链 / 撤回记录 / **分支**） */
 export function ledgerView(store: EvolveStore): unknown {
   const l: Ledger = store.ensureLedger()
   return {
@@ -428,7 +428,83 @@ export function ledgerView(store: EvolveStore): unknown {
     active: l.active,
     anchors: Object.fromEntries(Object.entries(l.resources).map(([k, r]) => [k, r.anchors])),
     rollbacks: l.rollbacks,
+    // 分支（Tree topology）：**空数组也是读数**——「没有分支」与「读不到」必须长得不一样
+    branches: l.branches ?? [],
   }
+}
+
+// ── 分支（RSI topology = Tree · 域图 P2） ──────────────────────────────────
+//
+// 判据（域图 §4 P2）：「能从既有锚点分叉出新版本并**并存**；判据：两条竞争性改动同时在账本里」。
+//
+// ⚠ **刻意不做合并语义**：判据只要求「并存」——把两条改动**都留在账本里**供比较与择一。
+// 自动合成第三份内容是判断代填，且内容冲突无法机械裁决。`merge` 的语义因此是
+// 「**把这条分支的 head 认作主干的新浮动版本**」（择一），不是「合体」。
+
+export interface BranchResult {
+  readonly branchId: string
+  readonly from: string
+  readonly head: string
+  /** 本次分叉新产出的版本号（= `head`） */
+  readonly version: string
+}
+
+/**
+ * 从既有版本分叉出新分支（**主干不动** ⇒ 两条改动并存）。
+ *
+ * 三处守卫（都是 fail-loud，不静默兜底）：
+ * ① `fromVersion` 必须是该资源**已有**的版本 ⇒ 否则抛错（凭空造祖先会让谱系断掉）
+ * ② 该资源必须已有版本链 ⇒ 否则抛错（给不存在的资源开分支 = 造幽灵资源）
+ * ③ 分支 id 由现有条数分配（`b0` 起）——**不复用已收口的 id**（历史不重名）
+ */
+export function openBranch(store: EvolveStore, resource: ResourceId, fromVersion: string, content: string, note: string): BranchResult {
+  const l = store.ensureLedger()
+  const res = l.resources[resource]
+  if (res === undefined || res.versions.length === 0) {
+    throw new Error('拒绝开分支：资源 `' + resource + '` 没有版本链（先 initLedger 或 edit 产生基线）')
+  }
+  if (!res.versions.some((v) => v.version === fromVersion)) {
+    throw new Error('拒绝开分支：`from` = ' + fromVersion + ' 不是 ' + resource + ' 的已有版本（不许凭空造祖先）')
+  }
+  const branches = l.branches ?? []
+  const version = store.addVersion(l, resource, content, 'branch(' + fromVersion + '): ' + note)
+  const id = 'b' + String(branches.length)
+  branches.push({ id, resource, from: fromVersion, head: version, note, at: new Date().toISOString(), state: 'open' })
+  l.branches = branches
+  store.writeLedger(l)
+  return { branchId: id, from: fromVersion, head: version, version }
+}
+
+export interface CloseBranchResult {
+  readonly branchId: string
+  readonly state: 'merged' | 'abandoned'
+  /** merge 时：主干的新浮动版本（= 该分支的 head） */
+  readonly activated?: string
+}
+
+/**
+ * 收口一条分支。
+ *
+ * - `merge`：把该分支的 head **认作主干的新浮动版本**（`l.active[resource] = head`）——
+ *   语义是**择一**，不是合体（见上方注释）。主干原有的浮动版本被顶替，但它仍在
+ *   `versions` 里（**不丢**），可用 `rollback` 找回。
+ * - `abandon`：只改状态，**不动主干、不删版本**（放弃 ≠ 抹掉历史）。
+ *
+ * 只对 `open` 生效：重复收口抛错（静默成功会让「合并了两次」这种事实消失）。
+ */
+export function closeBranch(store: EvolveStore, branchId: string, action: 'merge' | 'abandon', note: string): CloseBranchResult {
+  const l = store.ensureLedger()
+  const branch = (l.branches ?? []).find((b) => b.id === branchId)
+  if (branch === undefined) throw new Error('未知分支：' + branchId)
+  if (branch.state !== 'open') throw new Error('分支 ' + branchId + ' 已是 ' + branch.state + '（收口只对 open 生效）')
+  branch.state = action === 'merge' ? 'merged' : 'abandoned'
+  branch.closedNote = note
+  branch.closedAt = new Date().toISOString()
+  if (action === 'merge') l.active[branch.resource] = branch.head
+  store.writeLedger(l)
+  return action === 'merge'
+    ? { branchId, state: 'merged', activated: branch.head }
+    : { branchId, state: 'abandoned' }
 }
 
 /** child 终态扫描器的默认实现（会话不在场 ⇒ undefined，不假装「完整」也不无中生有扣帽子） */

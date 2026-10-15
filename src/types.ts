@@ -60,8 +60,34 @@ export interface ResourceVersion {
 export interface Resource {
   id: ResourceId
   versions: ResourceVersion[]
-  /** 锚点版本号（已验证，按序） */
+  /** 锚点版本号（已验证，按序）——**主干**的线性链，语义不因分支而变 */
   anchors: string[]
+}
+
+/**
+ * 并存的分支（RSI topology = Tree 的落地形态 · 域图 P2）。
+ *
+ * 存在的理由：旧形态只有一条链——`anchors` 是**线性数组**、`active` 是**单值**，
+ * 于是「两条竞争性改动」在账本里**结构上装不下**（只能串行，或整体回滚）。
+ * 分支把「从哪个版本分叉、分叉后走到哪」记成**独立记录**，主干一字不动 ⇒ 两者并存。
+ *
+ * ⚠ `Ledger.branches` 是**可选**字段：无分支时行为与旧版逐字节一致（零迁移成本）。
+ */
+export interface Branch {
+  /** 分支 id（`b<n>`，账本内唯一；由 `openBranch` 按现有分支数分配） */
+  id: string
+  resource: ResourceId
+  /** 分叉点：必须是该资源**已有**的版本号（不许凭空造祖先） */
+  from: string
+  /** 该分支当前版本号（开分支时 = 新产出的版本） */
+  head: string
+  note: string
+  at: string
+  /** `open` 并存中 · `merged` 已合入主干 · `abandoned` 已放弃（**保留记录，不删**） */
+  state: 'open' | 'merged' | 'abandoned'
+  /** 收口说明（merge / abandon 时写） */
+  closedNote?: string
+  closedAt?: string
 }
 
 export interface Generation {
@@ -91,6 +117,8 @@ export interface Ledger {
   generations: Generation[]
   edits: { version: string; resource: ResourceId; note: string; at: string; diff?: ResourceVersion['diff'] }[]
   rollbacks: { at: string; fromVersion: string; toVersion: string; note: string }[]
+  /** 并存的分支（缺省不存在 ⇒ 纯线性，与旧版一致） */
+  branches?: Branch[]
 }
 
 export interface RunState {

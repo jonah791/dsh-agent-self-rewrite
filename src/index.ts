@@ -50,6 +50,7 @@ import {
   SINK_RESOURCE_IDS,
   assertWorkspaceReady,
   buildTaskPrompt,
+  closeBranch,
   commitOrRollback,
   editResource,
   extractRules,
@@ -57,6 +58,7 @@ import {
   ledgerView,
   listOrphans,
   makeChildScanner,
+  openBranch,
   reapRuns,
   recordRun,
   sinkOf,
@@ -703,15 +705,17 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ⑤ rewrite_commit ----------
   ctx.tools.register(tool({
     name: 'rewrite_commit',
-    description: '资源与锚点：action=edit 写新版本（**按落点落盘**——agent-rules 走标记段 + 预算裁决，candidate-prompt 走整文件）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号，**遍历全部落点**）。无落点的资源（composition）会**如实报「未写盘」**，不静默漂移。',
+    description: '资源、锚点与分支：action=edit 写新版本（**按落点落盘**——agent-rules 走标记段 + 预算裁决，candidate-prompt 走整文件）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号，**遍历全部落点**）/ branch 从既有版本**分叉**出新分支（主干不动 ⇒ 两条竞争性改动并存）/ branches 列出全部分支 / merge 把分支 head 认作主干浮动版本（**择一，不是合体**）/ abandon 放弃分支（保留记录）。无落点的资源（composition）会**如实报「未写盘」**，不静默漂移。',
     parameters: {
-      action: { type: 'string', required: true, description: 'edit | commit | rollback' },
-      resource: { type: 'string', description: 'edit：agent-rules | candidate-prompt（composition 无落点，会报未写盘）' },
-      newContent: { type: 'string', description: 'edit：新内容全文' },
+      action: { type: 'string', required: true, description: 'edit | commit | rollback | branch | branches | merge | abandon' },
+      resource: { type: 'string', description: 'edit / branch：agent-rules | candidate-prompt（composition 无落点，会报未写盘）' },
+      newContent: { type: 'string', description: 'edit / branch：新内容全文' },
       note: { type: 'string', description: '说明' },
+      from: { type: 'string', description: 'branch：分叉点版本号（必须是该资源**已有**的版本——不许凭空造祖先）' },
+      branchId: { type: 'string', description: 'merge / abandon：分支 id（来自 branch 或 branches）' },
     },
     output: textOut,
-    async execute(args: { action: string; resource?: string; newContent?: string; note?: string }) {
+    async execute(args: { action: string; resource?: string; newContent?: string; note?: string; from?: string; branchId?: string }) {
       const action = args.action.trim()
       if (action === 'edit') {
         if (args.resource === undefined || args.newContent === undefined) return { text: 'edit 需要 resource 与 newContent' }
@@ -747,7 +751,50 @@ export function apply(ctx: Context, config: Config): void {
         }
         return { text: '已回滚到锚点 ' + r.anchor + '（无可回滚的浮动版本）' }
       }
-      return { text: '未知 action：' + action + '（可用 edit | commit | rollback）' }
+      if (action === 'branch') {
+        if (args.resource === undefined || args.from === undefined || args.newContent === undefined) {
+          return { text: 'branch 需要 resource、from（分叉点版本号）与 newContent' }
+        }
+        const rid = args.resource.trim()
+        if (!RESOURCE_IDS.includes(rid as ResourceId)) {
+          return { text: '未知资源：' + rid + '（可用：' + RESOURCE_IDS.join(' | ') + '）' }
+        }
+        try {
+          const r = openBranch(store, rid as ResourceId, args.from.trim(), args.newContent, args.note ?? '')
+          return {
+            text: '已开分支 ' + r.branchId + '（' + r.from + ' → ' + r.head + '）——主干**未动**，两条改动并存'
+              + '\n⚠ 分支不落盘：它是账本里的并存候选；合入主干（action=merge）后才走落点。',
+          }
+        } catch (e) {
+          return { text: '未开分支：' + (e instanceof Error ? e.message : String(e)) }
+        }
+      }
+      if (action === 'branches') {
+        const list = store.ensureLedger().branches ?? []
+        if (list.length === 0) return { text: '分支：0 条（账本里没有并存分支——纯线性拓扑）' }
+        const rows = list.map((b) => '  ' + b.id + ' [' + b.state + '] ' + b.resource + ' ' + b.from + ' → ' + b.head
+          + (b.note !== '' ? ' · ' + b.note : '')
+          + (b.state === 'open' ? '' : '（' + String(b.closedNote ?? '') + '）'))
+        const open = list.filter((b) => b.state === 'open').length
+        return { text: '分支：' + String(list.length) + ' 条（open ' + String(open) + '）\n' + rows.join('\n') }
+      }
+      if (action === 'merge' || action === 'abandon') {
+        if (args.branchId === undefined) return { text: action + ' 需要 branchId' }
+        const kind: 'merge' | 'abandon' = action === 'merge' ? 'merge' : 'abandon'
+        try {
+          const r = closeBranch(store, args.branchId.trim(), kind, args.note ?? '')
+          if (r.state === 'merged') {
+            return {
+              text: '已合入主干：' + r.branchId + '（浮动版本 → ' + String(r.activated ?? '')
+                + '）\n⚠ 主干浮动版本已变——要落盘需再走 action=commit（或 rollback 撤回）。',
+            }
+          }
+          return { text: '已放弃：' + r.branchId + '（主干未动、版本未删——放弃 ≠ 抹掉历史）' }
+        } catch (e) {
+          return { text: '未收口：' + (e instanceof Error ? e.message : String(e)) }
+        }
+      }
+      return { text: '未知 action：' + action + '（可用 edit | commit | rollback | branch | branches | merge | abandon）' }
     },
   }))
 
