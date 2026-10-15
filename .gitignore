@@ -2,3 +2,5 @@ node_modules
 lib/
 *.tsbuildinfo
 state/
+# 升级/挂载流程留下的临时备份（package.json.bak-<日期> 等）——原始文件都在，备份不入库
+*.bak-*

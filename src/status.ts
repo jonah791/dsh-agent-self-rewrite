@@ -37,6 +37,8 @@ export interface StatusCounts {
   readonly findings: number
   readonly confirmed: number
   readonly refuted: number
+  /** 正常归档态（`archived`）——独立一档：它是**正常状态**，不是「未知取值」（混进 `other` 会让读数口径失真） */
+  readonly archived: number
   readonly other: number
   /** 使能型声明的**待兑现**数（`pending`）——独立一档，**不并入 active**（并入会掩盖「采证链停」） */
   readonly pending: number
@@ -55,14 +57,22 @@ export interface StatusReport {
   readonly text: string
 }
 
-/** 假设库里的已知状态之外的都归 `other`（不猜、不吞） */
-const KNOWN = new Set(['active', 'finding', 'confirmed', 'refuted', 'pending'])
-
+/**
+ * 假设库的状态分类。
+ *
+ * `other` 的口径 = **`HypothesisStatus` 六态之外的取值**（数据损坏 / 旧版本写入 / 手改）——
+ * 正常状态一律独立成档，**不许混进 `other`**。`archived` 曾落在这里，让「读数口径不准」
+ * 与「数据真的坏了」长得一样（2026-10-15 修 · t-2a164936）。
+ *
+ * ⚠ 不要恢复「用一个 KNOWN 集合 + else 兜底」的写法：那种写法把**新状态默认归入未知**，
+ * 加一档就要记得改两处（集合与 if 链），而漏改的那一处**静默生效**——本次事故的形状。
+ */
 export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusCounts, 'anchors' | 'runs' | 'unclosed'> {
   let active = 0
   let findings = 0
   let confirmed = 0
   let refuted = 0
+  let archived = 0
   let pending = 0
   let other = 0
   for (const h of hypotheses) {
@@ -70,10 +80,11 @@ export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusC
     else if (h.status === 'finding') findings += 1
     else if (h.status === 'confirmed') confirmed += 1
     else if (h.status === 'refuted') refuted += 1
+    else if (h.status === 'archived') archived += 1
     else if (h.status === 'pending') pending += 1
     else other += 1
   }
-  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, pending, other }
+  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, archived, pending, other }
 }
 
 /** 账本可读 ⇒ 锚点总数；不可读 ⇒ `null`（区分「没有锚点」与「读不到账本」） */
@@ -494,7 +505,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
   } else if (base.hypotheses === 0) {
     notes.push('假设库为空：五环的「猜想」环当前无内容')
   }
-  if (base.other > 0) notes.push(`有 ${base.other} 条假设的状态不在 active/finding/confirmed/refuted/pending 五态内（含 archived 与未知取值）——原样计数，未归类`)
+  if (base.other > 0) notes.push(`有 ${base.other} 条假设的状态不在 HypothesisStatus 六态（active/finding/confirmed/refuted/archived/pending）内——原样计数，未归类（这种取值只该来自数据损坏 / 旧版本写入 / 手改）`)
 
   const anchors = countAnchors(input.ledger)
   if (!input.ledger.ok) {
@@ -520,7 +531,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
     )
   }
   lines.push(
-    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / pending ${base.pending}${base.other ? ` / other ${base.other}` : ''}）`,
+    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / archived ${base.archived} / pending ${base.pending}${base.other ? ` / other ${base.other}` : ''}）`,
     `锚点：${anchorText}`,
     `runs 记录：${input.runs.length}（${statusBreakdown(input.runs)}）· 未收尾 ${unclosed}`,
   )
