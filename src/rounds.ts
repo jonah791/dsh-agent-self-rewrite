@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { EvolveStore } from './ledger-store.js'
-import type { Ledger, ResourceId, ResourceSink } from './types.js'
+import type { Borrowing, Ledger, ResourceId, ResourceSink, VersionRef } from './types.js'
 import { renderPreset } from './presets.js'
 import { runFullEval } from './evaluator.js'
 import {
@@ -430,6 +430,8 @@ export function ledgerView(store: EvolveStore): unknown {
     rollbacks: l.rollbacks,
     // 分支（Tree topology）：**空数组也是读数**——「没有分支」与「读不到」必须长得不一样
     branches: l.branches ?? [],
+    // 借鉴边（Graph topology）：同上——空数组是读数，不是「读不到」
+    borrowings: l.borrowings ?? [],
   }
 }
 
@@ -517,4 +519,163 @@ export function makeChildScanner(getAgent: (sessionId: string) => unknown): (ses
     const read = (session.eventAt as (seq: number) => unknown).bind(session)
     return scanSessionOutcome(read, session.seq as number)
   }
+}
+
+// ── 借鉴（RSI topology = Graph · 域图 P6） ────────────────────────────────
+//
+// 判据（域图 §4 P6）：「版本谱系可跨线索借鉴」。
+//
+// ⚠ **与 Tree 的差别在多父**：`branches` 只记分叉（每版本一个父），版本层因此仍是树；
+// 借鉴边让一个版本**同时**从多条线索学（跨 resource / 跨分支）⇒ 版本层成为 DAG。
+// ⚠ **刻意不产内容**：借鉴只登记「这个版本从谁那里学的」这一事实。自动合成第三份内容是
+// 判断代填（内容冲突无法机械裁决）——与 P2 拒掉 merge 合体的理由同一条。合成由我写
+// （action=edit），写完再登记来源边。
+
+/** 版本坐标的规范化键（比较与查表用；`resource@version` 无歧义） */
+function refKey(r: VersionRef): string {
+  return r.resource + '@' + r.version
+}
+
+/** 该版本坐标在账本里**确实存在**（凭空造来源会让谱系断掉，故两端都要查） */
+function hasVersion(l: Ledger, ref: VersionRef): boolean {
+  const res = l.resources[ref.resource]
+  return res !== undefined && res.versions.some((v) => v.version === ref.version)
+}
+
+/**
+ * 从 `start` 沿借鉴边**正向**是否可达 `target`（防环判据）。
+ *
+ * 新增边 `from → to` 会成环 ⇔ `to` 已可达 `from`。用 `seen` 集合保证终止——
+ * 不依赖「图里本来无环」这个前提（那正是本函数要守的不变量，循环论证不算守卫）。
+ */
+function reachable(l: Ledger, start: VersionRef, target: VersionRef): boolean {
+  const edges = l.borrowings ?? []
+  const seen = new Set<string>([refKey(start)])
+  const queue: VersionRef[] = [start]
+  while (queue.length > 0) {
+    const cur = queue.shift()
+    if (cur === undefined) break
+    for (const b of edges) {
+      if (refKey(b.from) !== refKey(cur)) continue
+      const k = refKey(b.to)
+      if (k === refKey(target)) return true
+      if (seen.has(k)) continue
+      seen.add(k)
+      queue.push(b.to)
+    }
+  }
+  return false
+}
+
+export interface BorrowResult {
+  readonly borrowingId: string
+  readonly from: VersionRef
+  readonly to: VersionRef
+}
+
+/**
+ * 登记一条借鉴边（跨线索来源 → 借鉴产物）。
+ *
+ * 五处守卫（都是 fail-loud，不静默兜底）：
+ * ① 自指 ⇒ 拒（同一个版本借自己会让谱系凭空多一环）
+ * ② 两端的版本必须**已存在** ⇒ 拒（不许凭空造来源；`composition` 没有版本链，自然被这条拦住）
+ * ③ 同一条边重复登记 ⇒ 拒（图里出现两条同样的边会让读数虚高）
+ * ④ **成环** ⇒ 拒（谱系必须是 DAG——它同时是 `lineageOf` 终止的前提）
+ * ⑤ id 由现有条数分配（`x0` 起）——不复用已删 id（历史不重名）
+ *
+ * ⚠ **不写盘**：借鉴是账本层的关系声明，没有内容要落到盘上。调用方必须如实这么报。
+ */
+export function openBorrowing(store: EvolveStore, from: VersionRef, to: VersionRef, note: string): BorrowResult {
+  const l = store.ensureLedger()
+  if (refKey(from) === refKey(to)) {
+    throw new Error('拒绝登记借鉴：两端是同一个版本（' + refKey(from) + '）——自指会让谱系凭空多一环')
+  }
+  if (!hasVersion(l, from)) {
+    throw new Error('拒绝登记借鉴：from = ' + refKey(from) + ' 不是**已有**版本（不许凭空造来源）')
+  }
+  if (!hasVersion(l, to)) {
+    throw new Error('拒绝登记借鉴：to = ' + refKey(to) + ' 不是**已有**版本（不许凭空造产物）')
+  }
+  const list = l.borrowings ?? []
+  if (list.some((b) => refKey(b.from) === refKey(from) && refKey(b.to) === refKey(to))) {
+    throw new Error('拒绝登记借鉴：这条边已存在（' + refKey(from) + ' → ' + refKey(to) + '）——重复登记会让图里出现两条同样的边')
+  }
+  if (reachable(l, to, from)) {
+    throw new Error('拒绝登记借鉴：会成环——' + refKey(to) + ' 已可达 ' + refKey(from)
+      + '，再登记 ' + refKey(from) + ' → ' + refKey(to) + ' 会让谱系不是 DAG')
+  }
+  const id = 'x' + String(list.length)
+  list.push({ id, from, to, note, at: new Date().toISOString() })
+  l.borrowings = list
+  store.writeLedger(l)
+  return { borrowingId: id, from, to }
+}
+
+/** 谱系上的一行（坐标 + 距离 + 边说明） */
+export interface LineageRow {
+  readonly resource: ResourceId
+  readonly version: string
+  /** 距离：1 = 直接来源，2 = 来源的来源…（起点自己不算来源，故从 1 起） */
+  readonly depth: number
+  readonly note: string
+}
+
+/**
+ * 正向来源（**祖先**）：这个版本从哪些版本学来的——跨线索，多跳。
+ *
+ * 纯函数（传账本，不碰盘）⇒ 可离线测。返回**空数组**是读数（「没有登记来源」），
+ * 与「读不到」必须长得不一样。
+ */
+export function lineageOf(l: Ledger, ref: VersionRef): LineageRow[] {
+  const edges = l.borrowings ?? []
+  const rows: LineageRow[] = []
+  const seen = new Set<string>([refKey(ref)])
+  let frontier: { ref: VersionRef; depth: number }[] = [{ ref, depth: 0 }]
+  while (frontier.length > 0) {
+    const next: { ref: VersionRef; depth: number }[] = []
+    for (const node of frontier) {
+      for (const b of edges) {
+        if (refKey(b.to) !== refKey(node.ref)) continue
+        const k = refKey(b.from)
+        if (seen.has(k)) continue
+        seen.add(k)
+        rows.push({ resource: b.from.resource, version: b.from.version, depth: node.depth + 1, note: b.note })
+        next.push({ ref: b.from, depth: node.depth + 1 })
+      }
+    }
+    frontier = next
+  }
+  return rows
+}
+
+/**
+ * 反向影响（**后代**）：这个版本被哪些版本借鉴过——跨线索，多跳。
+ *
+ * 与 `lineageOf` 是一对：前者答「我从哪来」，本函数答「谁用过我」。
+ */
+export function borrowedBy(l: Ledger, ref: VersionRef): LineageRow[] {
+  const edges = l.borrowings ?? []
+  const rows: LineageRow[] = []
+  const seen = new Set<string>([refKey(ref)])
+  let frontier: { ref: VersionRef; depth: number }[] = [{ ref, depth: 0 }]
+  while (frontier.length > 0) {
+    const next: { ref: VersionRef; depth: number }[] = []
+    for (const node of frontier) {
+      for (const b of edges) {
+        if (refKey(b.from) !== refKey(node.ref)) continue
+        const k = refKey(b.to)
+        if (seen.has(k)) continue
+        seen.add(k)
+        rows.push({ resource: b.to.resource, version: b.to.version, depth: node.depth + 1, note: b.note })
+        next.push({ ref: b.to, depth: node.depth + 1 })
+      }
+    }
+    frontier = next
+  }
+  return rows
+}
+
+/** 全部借鉴边（**空数组也是读数**——「没有登记借鉴」≠「读不到」） */
+export function borrowingsOf(l: Ledger): Borrowing[] {
+  return l.borrowings ?? []
 }

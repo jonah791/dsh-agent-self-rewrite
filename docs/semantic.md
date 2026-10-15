@@ -65,8 +65,8 @@
 | `rewrite_hypothesis` | `add` 登记（普通假设 / **使能型声明**：给 `deps`）/ `fulfill` 兑现使能型声明 / `refine` 细化 / `archive` 淘汰（**保留条目**，只改状态）/ `purge` **永久删除**（默认干跑 + 留痕；用于清理**验收探针**）/ `list` 列出 | `selftest_add`（+ refine / archive / purge 分支） |
 | `rewrite_verdict` | 裁决并**当场布线**——**唯一写 `AGENTS.md` 的入口** | `selftest_review` + `evolve_edit` 的 agent-rules 分支 |
 | `rewrite_evaluate` | `init` / `start` / `spawn` / `submit` / `reap` / `orphans` | `evolve_init` + `evolve_round_start` + `evolve_spawn` + `evolve_submit` + `evolve_reap` |
-| `rewrite_commit` | `edit` 写新版本 / `commit` 锚定 / `rollback` 回滚 | `evolve_edit` + `evolve_commit` |
-| `rewrite_history` | 履历：代 / 版本 / 分数 / 锚点链 / 撤回记录 | `evolve_ledger` 的读侧 |
+| `rewrite_commit` | `edit` 写新版本 / `commit` 锚定 / `rollback` 回滚 / `branch`·`branches`·`merge`·`abandon` 分支（Tree topology · P2）/ `borrow` 登记**跨线索借鉴边** · `lineage` 双向查谱系（Graph topology · P6） | `evolve_edit` + `evolve_commit` |
+| `rewrite_history` | 履历：代 / 版本 / 分数 / 锚点链 / 撤回记录 / **借鉴谱系**（P6） | `evolve_ledger` 的读侧 |
 
 `evolve_orphans` 不再作为独立工具——孤儿清单并入 `rewrite_status`，收尸是 `rewrite_evaluate` 的一个分支（不该由人手工触发两次）。
 
@@ -239,6 +239,11 @@ recycleOldest(inner, fits, keep = 1)   // 从最旧端逐条移出，直到 fits
 | **判据有区分力**（尸体对照）：两处注入（缺读数当 0 / 去掉噪声检查）⇒ **恰好红 5 条**，另 6 条不受影响；撤销 ⇒ 全绿 | 2026-10-15 实跑（绿 → 红 5 → 绿） | 已实测 |
 | **接入点**：`rewrite_history` 报三要素裁决；不给 `minGainPerCost` ⇒ **不裁**（价值取舍不代填） | 同上「接入点」三条用例 | 已实测 |
 | **线上生效**：重启后 `rewrite_history` 出现「候选选择」段 | 待 web 重启后实调 | **待线上验收** |
+| **跨线索借鉴**（P6）：一条边两端分属不同 resource，且**双向多跳可查**（`lineageOf` 祖先 / `borrowedBy` 后代） | `tests/borrow.test.mjs` 用例 1/7/8（跨线索登记 + 二跳跨线索 depth=2 + 反向） | 已实测 |
+| **四处守卫 fail-loud**（P6）：自指 ⇒ 拒 · 两端版本必须已存在 ⇒ 拒 · 重复边 ⇒ 拒 · **成环 ⇒ 拒**（两节点环与三节点环都拦） | 同上用例 3/4/5/6 | 已实测 |
+| **判据有区分力**（尸体对照）：四处守卫各摘一个 ⇒ **恰好红 4 条**（正是四条守卫对应的测试），另 6 条不受影响；撤销 ⇒ `282/282` | 2026-10-15 实跑（绿 → 红 4 → 绿），零误伤 | 已实测 |
+| **空谱系分型**：「版本不在账本里」与「在册但没有登记来源」必须长得不一样 | 同上用例 9/10（后者断言空数组是读数）+ 工具面 `lineage` 对不存在版本报「问不到」 | 已实测 |
+| **线上生效**：重启后 `rewrite_commit(action=borrow/lineage)` 可用 | 待 web 重启后实调 | **待线上验收** |
 
 ## 8 · 与实现的关系
 
@@ -278,6 +283,7 @@ recycleOldest(inner, fits, keep = 1)   // 从最旧端逐条移出，直到 fits
 | 2026-10-15 | **第十版：分支（RSI topology = Tree）**（域图 P2）。触发是域图 §2.2 的 Tree ❌ 与 §4 的 P2：旧形态只有一条链——`anchors` 是**线性数组**、`active` 是**单值**，于是「两条竞争性改动」在账本里**结构上装不下**（只能串行，或整体回滚）。**三处刻意的设计**：① **刻意不做合并语义**——判据（域图 §4 P2 原文）只要求「并存」（把两条改动都留在账本里供比较与择一），自动合成第三份内容是判断代填、且内容冲突无法机械裁决 ⇒ `merge` 的语义是「**把分支 head 认作主干浮动版本**」（择一），`abandon` 保留记录不删版本；② **向后兼容靠可选字段**（`Ledger.branches?`）：无分支时与旧版逐字节一致，零迁移成本（旧账本读出来是空数组而不是 `undefined`——「没有分支」与「读不到」必须长得不一样）；③ **三处守卫 fail-loud**（`from` 必须是已有版本 / 资源必须有版本链 / 重复收口抛错）——凭空造祖先会让谱系断掉，而那正是 Tree 存在的理由。**验收**：11 条新判据（含 5 条尸体）+ 尸体对照（三处守卫各摘一个 ⇒ **恰好红 4 条**、另 7 条不受影响、撤销 ⇒ `256/256`）。**方法论一处**：尸体验证时 `tsc` 报了 2 个错（`'branch' is possibly 'undefined'`——注入把类型窄化打断了），但 `noEmitOnError` 为假 ⇒ **仍然 emit** ⇒ 测试跑的是注入后的代码，验证有效；反过来说，「构建失败但测试照跑」是一个**静默风险**（若注入没生效，红的原因会被误读成判据有效）。 |
 | 2026-10-15 | **第十一版：候选选择合成判据（性能 × 成本 × 噪声）**（域图 P4）。触发是域图 §3.3 G7：三个读数**都在**（性能=评测分 / 成本=轮次墙钟 / 噪声=TEB 分半复核），但**没有合成判据** ⇒「性能涨了但代价是两倍时长」在读数里**不可见**（每处单独看都是绿的）。⇒ 新增纯函数模块 `src/candidate-choice.ts`：`compareCandidates` **四态裁决**（`pick` / `indistinguishable` / `incomparable` / `cost-unjustified`，决策顺序即语义）+ `describeChoice`（四态各一句，不许合并）。**三处刻意的语义精确性**：① `noisy` 是**三态**（`true` 在带内 / `false` 明确不在 / **`null` = 噪声读数不可得**）——把「测不出噪声」当成「没有噪声」正是 TEB 要防的（它的判据建立在**四次冻结重评**上，单次评测**给不出带**）；② **缺读数 ⇒ `incomparable`**，不按缺省算（拿 0 当代替会把「不知道」变成「很差」）；③ `minGainPerCost` **无缺省值**（「多少增益配得上多少代价」是**价值取舍**，本件不代填，§2.4）。**接入点**：`rewrite_history` 报出最近两代的三要素裁决（噪声传 `null`）。**本件的诚实结论**：每代只评测一次 ⇒ 噪声不可得 ⇒ 裁决**恒为「不可比」**——这不是失败，正是判据要说的：**单次分数差不构成选择依据**。**验收**：14 条新判据 + 尸体对照（两处注入：缺读数当 0 / 去掉噪声检查 ⇒ **恰好红 5 条**、另 6 条不受影响、撤销 ⇒ 全绿）。**方法论一处（上一版那条的当场复现）**：接 `choiceLines` 时 `tsc` 又报了 6 个 `possibly 'undefined'`（`noUncheckedIndexedAccess`），而 `BUILD=2` 的同时**测试仍 269/269 全绿**——**「构建失败但测试照跑」在同一天第二次出现**，印证它确实是静默风险而非偶发。 |
 
+| 2026-10-15 | **第十二版：借鉴边（RSI topology = Graph）**（域图 P6）。触发是域图 §3.2 的 G3 与 §2.2 的 Graph ❌：`branches` 只记**分叉**（每个版本一个父）⇒ 版本层是**树**，「同时借鉴多条历史线索」（论文 §3.3 的 Mendel Gödel Machine 跨谱系比较、GEPA Merge 取互补改动）在账本里**结构上装不下**。⇒ 加 `Borrowing`（多父边）+ `Ledger.borrowings?` + 四个纯函数（`openBorrowing` 薄 I/O / `lineageOf` / `borrowedBy` / `borrowingsOf`）+ 工具面两个动作（`borrow` / `lineage`）。**三处刻意的设计**：① **只记关系不合成**——「取互补改动」的合成是判断代填（内容冲突无法机械裁决），与上一版拒掉 `merge` 合体同一条理由；合成由我写（`action=edit`），机制只记来源；② **不写盘**（它是对**已存在版本**的关系声明，没有内容要落）⇒ 工具面**如实报「不落盘」**；③ **成环守卫是 DAG 的前提**，而它同时是 `lineageOf` 终止的前提 ⇒ 用 `seen` 集合保证终止，**不依赖「图里本来无环」这个待守的前提**（循环论证不算守卫）。**验收**：10 条新判据（含 4 条尸体）+ 尸体对照（五处注入 ⇒ **恰好红 4 条**、另 6 条不受影响、撤销 ⇒ `282/282`、`diff` 确认与注入前逐字节一致）。**顺带抓出一处文档-盘上漂移**：域图 §4/§8 自 P1 起记的 `v0.7.0`/`v0.8.0`/`v0.9.0` **在盘上不存在**——`package.json` 停在 `0.6.0`（skill-lifecycle 停在 `0.1.0`）⇒ 一并补正为 `0.10.0` / `0.3.0`。**教训**：写「vX.Y.Z 落地」时必须**真的改 `package.json`**，否则记的是一个**不存在的构建**（§5.22 五问之一「线上跑的是哪个构建」会答不出来）。 |
 ## 10 · 未决问题
 
 1. **两个历史标记段是否合并**：`evolve` 与 `self-test` 语义已同源（都是规则），但合并会改 `AGENTS.md` 既有结构，且 `dsh-evolution-core` 可能按段名读取 ⇒ 迁移期保持两段。

@@ -90,6 +90,39 @@ export interface Branch {
   closedAt?: string
 }
 
+/**
+ * 版本坐标（借鉴边的两端 · 域图 P6）。
+ *
+ * 用坐标而不是裸版本号，因为借鉴**跨线索**：`v0.3` 在两条 resource 里各存在一个，
+ * 只说版本号会让「借鉴自谁」有歧义。
+ */
+export interface VersionRef {
+  resource: ResourceId
+  version: string
+}
+
+/**
+ * 借鉴边（RSI topology = Graph 的落地形态 · 域图 P6）。
+ *
+ * 存在的理由：`branches` 只记**分叉**（每个版本一个父），版本层因此仍是树——
+ * 「同时借鉴多条历史线索」在账本里**结构上装不下**。借鉴边把「这个版本从谁那里学的」
+ * 记成**多父**关系，版本层从树变成 DAG（跨 resource / 跨分支都成立）。
+ *
+ * ⚠ 它**不产内容、不写盘**：借鉴是对**已存在版本**的关系声明（自动合成第三份内容是判断代填，
+ * 与 P2 拒掉 merge 合体的理由同一条）。
+ * ⚠ `Ledger.borrowings` 是**可选**字段：无借鉴时行为与旧版逐字节一致（零迁移成本）。
+ */
+export interface Borrowing {
+  /** 借鉴 id（`x<n>`，账本内唯一；由 `openBorrowing` 按现有条数分配——不复用已删 id） */
+  id: string
+  /** 借鉴来源（被学的那一方） */
+  from: VersionRef
+  /** 借鉴产物（学到的那一方） */
+  to: VersionRef
+  note: string
+  at: string
+}
+
 export interface Generation {
   gen: number
   version: string
@@ -119,6 +152,8 @@ export interface Ledger {
   rollbacks: { at: string; fromVersion: string; toVersion: string; note: string }[]
   /** 并存的分支（缺省不存在 ⇒ 纯线性，与旧版一致） */
   branches?: Branch[]
+  /** 跨线索借鉴边（缺省不存在 ⇒ 版本层是树，与旧版一致） */
+  borrowings?: Borrowing[]
 }
 
 export interface RunState {

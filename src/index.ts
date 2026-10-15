@@ -28,7 +28,7 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { EvolveStore } from './ledger-store.js'
-import { RESOURCE_IDS, type ResourceId, type ResourceSink } from './types.js'
+import { RESOURCE_IDS, type ResourceId, type ResourceSink, type VersionRef } from './types.js'
 import { compareCandidates, describeChoice } from './candidate-choice.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
@@ -50,6 +50,8 @@ import {
   RULES_FILE,
   SINK_RESOURCE_IDS,
   assertWorkspaceReady,
+  borrowedBy,
+  borrowingsOf,
   buildTaskPrompt,
   closeBranch,
   commitOrRollback,
@@ -57,8 +59,10 @@ import {
   extractRules,
   initLedger,
   ledgerView,
+  lineageOf,
   listOrphans,
   makeChildScanner,
+  openBorrowing,
   openBranch,
   reapRuns,
   recordRun,
@@ -749,17 +753,22 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ⑤ rewrite_commit ----------
   ctx.tools.register(tool({
     name: 'rewrite_commit',
-    description: '资源、锚点与分支：action=edit 写新版本（**按落点落盘**——agent-rules 走标记段 + 预算裁决，candidate-prompt 走整文件）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号，**遍历全部落点**）/ branch 从既有版本**分叉**出新分支（主干不动 ⇒ 两条竞争性改动并存）/ branches 列出全部分支 / merge 把分支 head 认作主干浮动版本（**择一，不是合体**）/ abandon 放弃分支（保留记录）。无落点的资源（composition）会**如实报「未写盘」**，不静默漂移。',
+    description: '资源、锚点与分支：action=edit 写新版本（**按落点落盘**——agent-rules 走标记段 + 预算裁决，candidate-prompt 走整文件）/ commit 浮动版本成为锚点 / rollback 回到最近锚点（不产生新版本号，**遍历全部落点**）/ branch 从既有版本**分叉**出新分支（主干不动 ⇒ 两条竞争性改动并存）/ branches 列出全部分支 / merge 把分支 head 认作主干浮动版本（**择一，不是合体**）/ abandon 放弃分支（保留记录）/ borrow 登记**跨线索借鉴边**（版本层从树变 DAG：一个版本可同时从多条线索学）/ lineage 查某版本的来源与被借鉴（跨线索、多跳、双向可查）。无落点的资源（composition）会**如实报「未写盘」**，不静默漂移。',
     parameters: {
-      action: { type: 'string', required: true, description: 'edit | commit | rollback | branch | branches | merge | abandon' },
-      resource: { type: 'string', description: 'edit / branch：agent-rules | candidate-prompt（composition 无落点，会报未写盘）' },
+      action: { type: 'string', required: true, description: 'edit | commit | rollback | branch | branches | merge | abandon | borrow | lineage' },
+      resource: { type: 'string', description: 'edit / branch / lineage：agent-rules | candidate-prompt（composition 无落点，会报未写盘）' },
       newContent: { type: 'string', description: 'edit / branch：新内容全文' },
       note: { type: 'string', description: '说明' },
       from: { type: 'string', description: 'branch：分叉点版本号（必须是该资源**已有**的版本——不许凭空造祖先）' },
       branchId: { type: 'string', description: 'merge / abandon：分支 id（来自 branch 或 branches）' },
+      version: { type: 'string', description: 'lineage：版本号（缺省用该资源当前浮动版本）' },
+      fromResource: { type: 'string', description: 'borrow：借鉴来源的资源（与 toResource 不同即为**跨线索**）' },
+      fromVersion: { type: 'string', description: 'borrow：借鉴来源的版本号（必须**已存在**——不许凭空造来源）' },
+      toResource: { type: 'string', description: 'borrow：借鉴产物的资源' },
+      toVersion: { type: 'string', description: 'borrow：借鉴产物的版本号（必须**已存在**）' },
     },
     output: textOut,
-    async execute(args: { action: string; resource?: string; newContent?: string; note?: string; from?: string; branchId?: string }) {
+    async execute(args: { action: string; resource?: string; newContent?: string; note?: string; from?: string; branchId?: string; version?: string; fromResource?: string; fromVersion?: string; toResource?: string; toVersion?: string }) {
       const action = args.action.trim()
       if (action === 'edit') {
         if (args.resource === undefined || args.newContent === undefined) return { text: 'edit 需要 resource 与 newContent' }
@@ -838,21 +847,69 @@ export function apply(ctx: Context, config: Config): void {
           return { text: '未收口：' + (e instanceof Error ? e.message : String(e)) }
         }
       }
-      return { text: '未知 action：' + action + '（可用 edit | commit | rollback | branch | branches | merge | abandon）' }
+      if (action === 'borrow') {
+        if (args.fromResource === undefined || args.fromVersion === undefined || args.toResource === undefined || args.toVersion === undefined) {
+          return { text: 'borrow 需要 fromResource、fromVersion、toResource、toVersion' }
+        }
+        const ids = [args.fromResource.trim(), args.toResource.trim()]
+        const bad = ids.find((x) => !RESOURCE_IDS.includes(x as ResourceId))
+        if (bad !== undefined) return { text: '未知资源：' + bad + '（可用：' + RESOURCE_IDS.join(' | ') + '）' }
+        const from: VersionRef = { resource: args.fromResource.trim() as ResourceId, version: args.fromVersion.trim() }
+        const to: VersionRef = { resource: args.toResource.trim() as ResourceId, version: args.toVersion.trim() }
+        try {
+          const r = openBorrowing(store, from, to, args.note ?? '')
+          const cross = from.resource !== to.resource ? '**跨线索**' : '同线索'
+          return {
+            text: '已登记借鉴 ' + r.borrowingId + '（' + cross + '）：' + from.resource + '@' + from.version
+              + ' → ' + to.resource + '@' + to.version
+              + '\n⚠ **不落盘**：借鉴是账本层的关系声明（没有内容要写）——盘上不会因此变化。'
+              + '\n查它：action=lineage（resource=' + to.resource + '，version=' + to.version + '）',
+          }
+        } catch (e) {
+          return { text: '未登记：' + (e instanceof Error ? e.message : String(e)) }
+        }
+      }
+      if (action === 'lineage') {
+        if (args.resource === undefined) return { text: 'lineage 需要 resource（version 缺省用当前浮动版本）' }
+        const rid = args.resource.trim()
+        if (!RESOURCE_IDS.includes(rid as ResourceId)) {
+          return { text: '未知资源：' + rid + '（可用：' + RESOURCE_IDS.join(' | ') + '）' }
+        }
+        const l = store.ensureLedger()
+        const version = args.version !== undefined && args.version.trim() !== ''
+          ? args.version.trim()
+          : store.versionOf(l, rid as ResourceId)
+        const ref: VersionRef = { resource: rid as ResourceId, version }
+        // 「空谱系」必须分型：版本**不在账本里**与「在册但没有登记来源」是两件事
+        const inLedger = (l.resources[rid as ResourceId]?.versions.some((v) => v.version === version)) ?? false
+        const fmt = (rows: readonly { resource: string; version: string; depth: number; note: string }[]) => rows.length === 0
+          ? '  （无）'
+          : rows.map((r) => '  ' + '·'.repeat(r.depth) + ' ' + r.resource + '@' + r.version + (r.note !== '' ? ' · ' + r.note : '')).join('\n')
+        const up = lineageOf(l, ref)
+        const down = borrowedBy(l, ref)
+        return {
+          text: '谱系（' + rid + '@' + version + '）'
+            + (inLedger ? '' : '\n⚠ 版本 ' + version + ' **不在账本里**——下面的空不是「没有来源」，是「问不到」')
+            + '\n来源（我从哪来 · 跨线索多跳）：\n' + fmt(up)
+            + '\n被借鉴（谁用过我）：\n' + fmt(down)
+            + '\n全图：' + String(borrowingsOf(l).length) + ' 条边',
+        }
+      }
+      return { text: '未知 action：' + action + '（可用 edit | commit | rollback | branch | branches | merge | abandon | borrow | lineage）' }
     },
   }))
 
   // ---------- ⑥ rewrite_history ----------
   ctx.tools.register(tool({
     name: 'rewrite_history',
-    description: '履历：版本演进（代 / 版本 / 分数 / 结论）、活跃版本、锚点链、撤回记录、**候选选择裁决**（P4 三要素合成判据）。只读。'
+    description: '履历：版本演进（代 / 版本 / 分数 / 结论）、活跃版本、锚点链、撤回记录、**借鉴谱系**（P6 Graph：跨线索边）、**候选选择裁决**（P4 三要素合成判据）。只读。'
       + '⚠ 候选选择段需 `minGainPerCost`（「多少增益配得上多少代价」是**价值取舍**，本件不代填，§2.4）；不给 ⇒ 如实报「未给判据 ⇒ 不裁」。',
     parameters: {
       minGainPerCost: { type: 'number', description: '候选选择：性能增益 / 成本增加 的下限比（单位 性能分/毫秒）。不给 ⇒ 不裁（不代填价值取舍）' },
     },
     output: textOut,
     async execute(args: { minGainPerCost?: number }) {
-      const view = ledgerView(store) as { generations: unknown[]; anchors: Record<string, string[]>; rollbacks: unknown[] }
+      const view = ledgerView(store) as { generations: unknown[]; anchors: Record<string, string[]>; rollbacks: unknown[]; borrowings: { id: string; from: { resource: string; version: string }; to: { resource: string; version: string }; note: string }[] }
       const gens = view.generations as { gen: number; version: string; ability?: number; ship?: number; releaseClass?: string; note?: string }[]
       const lines = ['履历（账本视图）', '代：' + String(gens.length)]
       for (const g of gens) {
@@ -861,6 +918,18 @@ export function apply(ctx: Context, config: Config): void {
       }
       lines.push('锚点链：' + JSON.stringify(view.anchors))
       lines.push('撤回记录：' + String(view.rollbacks.length))
+      // 借鉴谱系（Graph）：**0 条边也是读数**——「没登记过借鉴」与「读不到」必须长得不一样
+      const edges = view.borrowings
+      if (edges.length === 0) {
+        lines.push('借鉴谱系：0 条边（版本层是**树**——没有登记过跨线索借鉴）')
+      } else {
+        const cross = edges.filter((b) => b.from.resource !== b.to.resource).length
+        lines.push('借鉴谱系：' + String(edges.length) + ' 条边（**跨线索** ' + String(cross) + '）')
+        for (const b of edges) {
+          lines.push('  ' + b.id + ' ' + b.from.resource + '@' + b.from.version + ' → ' + b.to.resource + '@' + b.to.version
+            + (b.note !== '' ? ' · ' + b.note : ''))
+        }
+      }
       lines.push(...choiceLines(gens, store, args.minGainPerCost))
       return { text: lines.join('\n') }
     },
