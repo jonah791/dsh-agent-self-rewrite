@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-self-rewrite",
-  "version": "0.3.0",
-  "description": "自改写引擎：AGENTS.md 标记段的唯一写者——把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。0.2.0 起回收带**保护（pinned）**：受保护的高频纪律永不被 FIFO 迁出（纯 FIFO 会静默迁走核心规则 ⇒ 行为退化，而报告里那句还是成功）。0.3.0 起带**停滞面**：报出「最后布线/最后采证 N 天前」与在采证条数（`active 0` = **采证链停**，停滞的根因），并把在采证的假设按**归一化剩余缺口**排序（取论文 SpecForge §3.2 `r̂ = Δφ/(1−φ)` 的排序含义：奖励接近完成的）。替换 dsh-agent-self-test + dsh-agent-evolve（设计见 docs/plans/插件融合设计_自改写与蒸馏_2026-09-23.md）。",
+  "version": "0.4.0",
+  "description": "自改写引擎：AGENTS.md 标记段的唯一写者——把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。0.2.0 起回收带**保护（pinned）**：受保护的高频纪律永不被 FIFO 迁出（纯 FIFO 会静默迁走核心规则 ⇒ 行为退化，而报告里那句还是成功）。0.3.0 起带**停滞面**：报出「最后布线/最后采证 N 天前」与在采证条数（`active 0` = **采证链停**，停滞的根因），并把在采证的假设按**归一化剩余缺口**排序（取论文 SpecForge §3.2 `r̂ = Δφ/(1−φ)` 的排序含义：奖励接近完成的）。0.4.0 起带**信号饥饿面**：把「请求的证据量（`threshold`）vs 落点的证据量（`evidence.length`）」显式暴露——取论文 TESEARCH（arXiv:2610.15964v1）§4 landing kernel 的含义（LLM 是 noisy actuator，请求与落点之间存在系统性偏差，必须建模并补偿）。实测驱动：32 条假设里 12 条证据恒 0、其中 8 条已裁 `refuted` ⇒ 「**未被检验**」被记成了「**被证伪**」，采证链静默停摆 24 天。读数按**探针分档**（论文 size-niche 的对应物：饥饿集中在哪类探针上，那是探针的系统性缺陷而非单条假设的问题），并随 `selfRewrite.snapshot()` 进感知圈载荷。替换 dsh-agent-self-test + dsh-agent-evolve（设计见 docs/plans/插件融合设计_自改写与蒸馏_2026-09-23.md）。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

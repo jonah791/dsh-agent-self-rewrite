@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { advanceQueue, buildStatus, collectStatus, countAnchors, countHypotheses, stalenessOf } from '../lib/status.js'
+import { advanceQueue, buildStatus, collectStatus, countAnchors, countHypotheses, selfRewriteSnapshot, stalenessOf, starvationOf } from '../lib/status.js'
 import { resolveLegacyPaths } from '../lib/store.js'
 
 const ok = (value) => ({ ok: true, value })
@@ -232,4 +232,114 @@ test('推进面三态不许同貌：库空 / 有布线 / 采证链停 各说各�
   assert.ok(live.text.includes('在采证 1 条'))
   assert.ok(live.text.includes('最接近阈值'), '有 active 时必须给出推进队列')
   assert.ok(!live.text.includes('采证链停'), '有 active 时不得报链停')
+})
+
+// ── 2026-10-15 加：信号饥饿面（论文 TESEARCH arXiv:2610.15964v1 迁移） ──────────
+// 论文 §4 landing kernel：LLM 是 noisy actuator——「请求生成 N 个」与「实际落 M 个」有系统性偏差，
+// 论文建模它并在请求时补偿。本引擎的对应物：登记时设 `threshold = N`（请求 N 条证据），探针落
+// `evidence.length` 条，而**系统从不比较这两者**。
+// 实测（2026-10-15）：32 条假设里 12 条证据恒 0，其中 8 条已裁 `refuted` ⇒ 采证链静默停摆 24 天。
+
+const bare = (status, kind, threshold, createdAt, evidenceCount = 0) => ({
+  id: `h-${status}-${kind}-${Math.random().toString(36).slice(2, 7)}`,
+  statement: 's', prediction: 'p', status, threshold,
+  probe: { kind }, createdAt, updatedAt: createdAt,
+  evidence: Array.from({ length: evidenceCount }, (_, i) => ({ ts: createdAt, kind, detail: { i } })),
+})
+
+test('starvationOf：零证据与「已裁 refuted」分开报——后者是「未被检验被记成被证伪」的直接量化', () => {
+  const hs = [
+    bare('refuted', 'probe-before-action', 8, '2026-09-11T00:00:00.000Z'),
+    bare('refuted', 'tool-failure-rate', 8, '2026-09-12T00:00:00.000Z'),
+    bare('active', 'plan-before-action', 5, '2026-09-13T00:00:00.000Z'),
+    bare('confirmed', 'tool-failure-rate', 3, '2026-09-14T00:00:00.000Z', 3),
+  ]
+  const s = starvationOf(hs, fixedNow)
+  assert.equal(s.zeroEvidence, 3, '三条零证据（含已裁的——三种状态指向三种不同的病）')
+  assert.equal(s.refutedWithoutEvidence, 2, 'refuted 且零证据 = 2')
+  assert.equal(s.confirmedWithoutEvidence, 0)
+  assert.equal(s.oldestZeroAgeDays, 34, '09-11 → 10-15 = 34 天')
+})
+
+test('starvationOf：按探针分档（论文 niche 的对应物）——饥饿集中在哪类探针上必须看得见', () => {
+  const hs = [
+    bare('refuted', 'probe-before-action', 8, '2026-09-11T00:00:00.000Z'),
+    bare('refuted', 'probe-before-action', 8, '2026-09-12T00:00:00.000Z'),
+    bare('active', 'plan-before-action', 5, '2026-09-13T00:00:00.000Z'),
+    bare('confirmed', 'tool-failure-rate', 3, '2026-09-14T00:00:00.000Z', 3),
+    bare('confirmed', 'tool-failure-rate', 3, '2026-09-15T00:00:00.000Z', 3),
+  ]
+  const s = starvationOf(hs, fixedNow)
+  assert.deepEqual(s.byProbe.map((p) => p.kind), ['probe-before-action', 'plan-before-action'], '全采到的探针档不占版面')
+  assert.deepEqual(s.byProbe[0], { kind: 'probe-before-action', total: 2, zeroEvidence: 2, maxAgeDays: 34 })
+})
+
+test('starvationOf：清单按年龄降序（最老在前）；年龄算不出的排最后而不是当「最年轻」', () => {
+  const hs = [
+    bare('active', 'k', 3, '2026-10-14T00:00:00.000Z'),
+    bare('active', 'k', 3, 'not-a-date'),
+    bare('active', 'k', 3, '2026-09-15T00:00:00.000Z'),
+  ]
+  const s = starvationOf(hs, fixedNow)
+  assert.deepEqual(s.rows.map((r) => r.ageDays), [30, 1, null])
+  assert.equal(s.oldestZeroAgeDays, 30, 'null 不进最老比较（「不知道」不是「最年轻」）')
+})
+
+test('信号面三态不许同貌：全采到 / 有零证据 / 库读不到', () => {
+  const allCollected = buildStatus({
+    selfTest: ok({ hypotheses: [bare('confirmed', 'tool-failure-rate', 3, '2026-09-14T00:00:00.000Z', 3)] }),
+    ledger: ok({ resources: {} }), runs: [],
+  }, fixedNow)
+  assert.ok(allCollected.text.includes('信号面：全部假设都已采到证据'), '全采到是一个好读数，要明说')
+
+  const starved = buildStatus({
+    selfTest: ok({ hypotheses: [bare('refuted', 'probe-before-action', 8, '2026-09-11T00:00:00.000Z')] }),
+    ledger: ok({ resources: {} }), runs: [],
+  }, fixedNow)
+  assert.ok(starved.text.includes('信号面：零证据 1 条'))
+  assert.ok(starved.text.includes('未被检验 ≠ 被证伪'), '「已裁 refuted 却零证据」必须显式点名')
+  assert.ok(starved.text.includes('probe-before-action 1/1'), '按探针分档必须在文本里')
+
+  const unreadable = buildStatus({ selfTest: fail('missing', '文件不存在：Q'), ledger: ok({ resources: {} }), runs: [] }, fixedNow)
+  assert.ok(!unreadable.text.includes('信号面：'), '库读不到时信号面必须整块缺席（不许印成「全部采到」）')
+})
+
+test('尸体：零证据判定改坏（把 0 条也当已采到）⇒ 该红；对照组零误伤', () => {
+  const s = starvationOf([bare('refuted', 'k', 8, '2026-09-11T00:00:00.000Z')], fixedNow)
+  assert.equal(s.zeroEvidence, 1, '真·零证据必须进清单')
+  const s2 = starvationOf([bare('refuted', 'k', 8, '2026-09-11T00:00:00.000Z', 1)], fixedNow)
+  assert.equal(s2.zeroEvidence, 0, '有证据者不得进零证据清单')
+  assert.equal(s2.byProbe.length, 0, '没有零证据的探针档不该占版面')
+})
+
+test('防御性读数：confirmed 却零证据 ⇒ 如实报（状态机不该产出此组合，不许吞）', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [bare('confirmed', 'k', 3, '2026-09-11T00:00:00.000Z', 0)] }),
+    ledger: ok({ resources: {} }), runs: [],
+  }, fixedNow)
+  assert.ok(r.text.includes('已裁 confirmed 1 条（状态机不该产出此组合，请查）'))
+})
+
+// ── 2026-10-15 加：信号面进感知圈载荷 ────────────────────────────────────────
+// 判据：读数要我主动查 ⇒ 停滞正是「没人推我」的结果（SpecForge 那轮的教训）。故信号面必须进载荷。
+
+test('snapshot：饥饿读数进载荷；hint 优先级 = 链停 > 饥饿 > 最接近阈值', () => {
+  const stopped = selfRewriteSnapshot([bare('confirmed', 'k', 3, '2026-09-14T00:00:00.000Z', 3)], fixedNow)
+  assert.ok(stopped.hint.includes('采证链停'), '无 active ⇒ 链停优先')
+
+  const hungry = selfRewriteSnapshot([
+    bare('active', 'probe-before-action', 8, '2026-09-11T00:00:00.000Z'),
+    bare('refuted', 'probe-before-action', 8, '2026-09-12T00:00:00.000Z'),
+  ], fixedNow)
+  assert.equal(hungry.starved, 2)
+  assert.equal(hungry.refutedWithoutEvidence, 1)
+  assert.equal(hungry.oldestStarvedDays, 34)
+  assert.ok(hungry.hint.includes('信号饥饿'), '有 active 且零证据 ⇒ 报饥饿（比「最接近阈值」更根本）')
+  assert.ok(hungry.hint.includes('未被检验 ≠ 被证伪'))
+  assert.ok(hungry.line.includes('零证据 2 条'), '一行摘要也要带饥饿读数')
+
+  const healthy = selfRewriteSnapshot([bare('active', 'k', 3, '2026-10-01T00:00:00.000Z', 1)], fixedNow)
+  assert.equal(healthy.starved, 0)
+  assert.ok(!healthy.line.includes('零证据'), '全采到时摘要不带饥饿段')
+  assert.ok(healthy.hint.includes('最接近阈值'), '正常状态给推进提示')
 })

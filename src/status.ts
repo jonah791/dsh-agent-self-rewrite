@@ -206,6 +206,134 @@ export function advanceQueue(hypotheses: readonly Hypothesis[]): readonly Advanc
     .sort((a, b) => (a.gapRatio === b.gapRatio ? b.evidence - a.evidence : a.gapRatio - b.gapRatio))
 }
 
+/** 某一类探针的采证落点统计 */
+export interface ProbeStarvation {
+  readonly kind: string
+  /** 用该探针的假设总数 */
+  readonly total: number
+  /** 其中证据恒 0 的条数 */
+  readonly zeroEvidence: number
+  /** 零证据者里最老的年龄（天）；算不出 ⇒ `null` */
+  readonly maxAgeDays: number | null
+}
+
+/** 零证据清单的一行 */
+export interface StarvationRow {
+  readonly id: string
+  readonly probeKind: string
+  readonly status: string
+  /** 请求的证据量（登记时设的阈值） */
+  readonly threshold: number
+  /** 登记至今的天数（向下取整）；解析不出 ⇒ `null` */
+  readonly ageDays: number | null
+  readonly resolution: string | null
+}
+
+/**
+ * 信号饥饿面：**请求的证据量 vs 落点的证据量**。
+ *
+ * 判据来源：论文 TESEARCH（arXiv:2610.15964v1）§4 的 landing kernel——LLM 是 noisy actuator，
+ * 「请求生成 N 个」与「实际落 M 个」之间存在系统性偏差，论文**建模该偏差并在请求时补偿**。
+ * 本引擎的对应物：假设登记时设 `threshold = N`（请求 N 条证据），探针实际落 `evidence.length` 条。
+ * **而系统从不比较这两者**——2026-10-15 实测：32 条假设里 12 条证据恒 0，其中 8 条已裁 `refuted`
+ * ⇒ 「**从未被检验**」被记成了「**被证伪**」，采证链因此静默停摆 24 天而无人知。
+ *
+ * ⚠ 三条刻意的边界：
+ * - **不设饥饿阈值**（§2.4 判断不可代填）：报出**年龄**，饿不饿由主体看——新登记的假设零证据是正常的；
+ * - **不分状态过滤**：`active` / `refuted` / `confirmed` 的零证据都算，因为它们指向三种不同的病；
+ * - **按探针分档**（论文 size-niche 的对应物）：饥饿若集中在某一类探针上，那是**探针的系统性缺陷**
+ *   而非某条假设的问题——混成一个总数就把这个信号抹平了。
+ */
+export interface Starvation {
+  /** 零证据假设数（全状态合计） */
+  readonly zeroEvidence: number
+  /** ⚠ 本面最值钱的一条：**已裁 `refuted` 却零证据** ⇒ 「未被检验」被记成了「被证伪」 */
+  readonly refutedWithoutEvidence: number
+  /** 已裁 `confirmed` 却零证据——状态机**不该**产出这种组合，出现即如实报（不吞） */
+  readonly confirmedWithoutEvidence: number
+  /** 零证据者里最老的年龄（天）；无零证据 ⇒ `null` */
+  readonly oldestZeroAgeDays: number | null
+  /** 按探针分档，只含**有零证据**的档（全采到的档不占版面） */
+  readonly byProbe: readonly ProbeStarvation[]
+  /** 零证据清单（最老在前）——**不设阈值**，让年龄自己说话 */
+  readonly rows: readonly StarvationRow[]
+}
+
+export function starvationOf(hypotheses: readonly Hypothesis[], now: Date): Starvation {
+  const rows: StarvationRow[] = []
+  const perProbe = new Map<string, { total: number; zero: number; oldest: number | null }>()
+  let refutedWithoutEvidence = 0
+  let confirmedWithoutEvidence = 0
+
+  for (const h of hypotheses) {
+    const kind = typeof h.probe?.kind === 'string' && h.probe.kind.length > 0 ? h.probe.kind : '(未标探针)'
+    const slot = perProbe.get(kind) ?? { total: 0, zero: 0, oldest: null }
+    slot.total += 1
+    const evidence = (h.evidence ?? []).length
+    if (evidence === 0) {
+      slot.zero += 1
+      const age = daysSince(h.createdAt, now)
+      if (age !== null && (slot.oldest === null || age > slot.oldest)) slot.oldest = age
+      if (h.status === 'refuted') refutedWithoutEvidence += 1
+      if (h.status === 'confirmed') confirmedWithoutEvidence += 1
+      rows.push({
+        id: h.id,
+        probeKind: kind,
+        status: h.status,
+        threshold: typeof h.threshold === 'number' && Number.isFinite(h.threshold) ? h.threshold : 0,
+        ageDays: age,
+        resolution: typeof h.resolution === 'string' ? h.resolution : null,
+      })
+    }
+    perProbe.set(kind, slot)
+  }
+
+  // 最老在前；年龄算不出的排最后（`null` 不进比较——它是「不知道」，不是「最年轻」）
+  rows.sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1))
+
+  const byProbe = [...perProbe.entries()]
+    .filter(([, v]) => v.zero > 0)
+    .map(([kind, v]) => ({ kind, total: v.total, zeroEvidence: v.zero, maxAgeDays: v.oldest }))
+    .sort((a, b) => (b.maxAgeDays ?? -1) - (a.maxAgeDays ?? -1))
+
+  const oldest = rows.reduce<number | null>(
+    (acc, r) => (r.ageDays === null ? acc : acc === null || r.ageDays > acc ? r.ageDays : acc),
+    null,
+  )
+
+  return {
+    zeroEvidence: rows.length,
+    refutedWithoutEvidence,
+    confirmedWithoutEvidence,
+    oldestZeroAgeDays: oldest,
+    byProbe,
+    rows,
+  }
+}
+
+/**
+ * 信号面的渲染。
+ *
+ * ⚠ 三态不许同貌：**无零证据** ⇒ 明说「全部采到」（那是一个**好读数**，不是空）；**有零证据** ⇒
+ * 给出条数、最老年龄、以及**已裁 refuted 的条数**（那是「未被检验被记成被证伪」的直接量化）。
+ */
+function signalLine(s: Starvation): string {
+  if (s.zeroEvidence === 0) return '信号面：全部假设都已采到证据（落点 = 请求）'
+  const oldest = s.oldestZeroAgeDays === null ? '年龄不可算' : `最老 ${String(s.oldestZeroAgeDays)} 天`
+  const head = `信号面：零证据 ${String(s.zeroEvidence)} 条（${oldest}）`
+  const refuted = s.refutedWithoutEvidence > 0
+    ? ` · ⚠ 其中已裁 refuted ${String(s.refutedWithoutEvidence)} 条——**未被检验 ≠ 被证伪**`
+    : ''
+  const confirmed = s.confirmedWithoutEvidence > 0
+    ? ` · ⚠ 已裁 confirmed ${String(s.confirmedWithoutEvidence)} 条（状态机不该产出此组合，请查）`
+    : ''
+  const probes = s.byProbe.length === 0
+    ? ''
+    : '\n  按探针分档（哪类探针系统性采不到）：'
+      + s.byProbe.map((p) => `${p.kind} ${String(p.zeroEvidence)}/${String(p.total)}`).join(' · ')
+  return head + refuted + confirmed + probes
+}
+
 /** 推进面的渲染（纯文本层；不可用时不渲染——那是 `notes` 的职责，不许两处都说同一件事） */
 function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
   if (stale.lastWiredAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0) {
@@ -242,6 +370,12 @@ export interface SelfRewriteSnapshot {
   readonly daysSinceWired: number | null
   readonly daysSinceEvidence: number | null
   readonly collecting: number
+  /** 零证据假设数（**信号饥饿**：请求了 N 条证据、落点 0 条） */
+  readonly starved: number
+  /** 其中**已裁 `refuted`** 的条数——「未被检验」被记成「被证伪」的直接量化 */
+  readonly refutedWithoutEvidence: number
+  /** 零证据者里最老的年龄（天）；无 ⇒ `null` */
+  readonly oldestStarvedDays: number | null
   /** 推进队列首位（归一化缺口最小者）；无在采证假设 ⇒ `null` */
   readonly nextUp: AdvanceRow | null
   /** 感知圈是否该带这段（见上方判据） */
@@ -255,18 +389,32 @@ export interface SelfRewriteSnapshot {
 export function selfRewriteSnapshot(hypotheses: readonly Hypothesis[], now: Date): SelfRewriteSnapshot {
   const stale = stalenessOf(hypotheses, now)
   const queue = advanceQueue(hypotheses)
+  const starve = starvationOf(hypotheses, now)
   const next = queue.length > 0 ? (queue[0] as AdvanceRow) : null
   const wired = stale.daysSinceWired === null ? '从未布线' : `最后布线 ${String(stale.daysSinceWired)} 天前`
   const evidence = stale.daysSinceEvidence === null ? '从未采证' : `最后采证 ${String(stale.daysSinceEvidence)} 天前`
-  const line = `${wired} · ${evidence} · 在采证 ${String(stale.collecting)} 条`
+  const starved = starve.zeroEvidence === 0 ? '' : ` · 零证据 ${String(starve.zeroEvidence)} 条`
+  const line = `${wired} · ${evidence} · 在采证 ${String(stale.collecting)} 条${starved}`
+  // hint 优先级：**链停**（最严重——没有 active，探针根本不会积累证据）
+  //   → **饥饿**（有 active 却采不到：请求与落点的偏差，先查探针有没有机会采）
+  //   → 最接近阈值（正常推进状态）
+  const oldest = starve.oldestZeroAgeDays === null ? '' : `（最老 ${String(starve.oldestZeroAgeDays)} 天）`
+  const refutedNote = starve.refutedWithoutEvidence > 0
+    ? `，其中 ${String(starve.refutedWithoutEvidence)} 条已裁 refuted——**未被检验 ≠ 被证伪**`
+    : ''
   const hint = stale.collecting === 0
     ? '⚠ 采证链停：没有 active 假设，探针不会积累证据 ⇒ 要推进五环，先 rewrite_hypothesis(action=add) 登记一条可证伪猜想'
-    : (next === null ? null : `最接近阈值：${next.id} ${String(next.evidence)}/${String(next.threshold)}`)
+    : (starve.zeroEvidence > 0
+      ? `⚠ 信号饥饿：${String(starve.zeroEvidence)} 条假设证据恒 0${oldest}${refutedNote} ⇒ 先查这些探针**有没有机会采到**，再谈推进`
+      : (next === null ? null : `最接近阈值：${next.id} ${String(next.evidence)}/${String(next.threshold)}`))
   return {
     at: now.toISOString(),
     daysSinceWired: stale.daysSinceWired,
     daysSinceEvidence: stale.daysSinceEvidence,
     collecting: stale.collecting,
+    starved: starve.zeroEvidence,
+    refutedWithoutEvidence: starve.refutedWithoutEvidence,
+    oldestStarvedDays: starve.oldestZeroAgeDays,
     nextUp: next,
     signal: hypotheses.length > 0,
     line,
@@ -318,6 +466,8 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
     // ⚠ 守卫是刻意的：库**读不到**时 `hypotheses` 也是空数组，直接渲染会把「读不到」印成
     // 「无假设」（两种情形必须长得不一样——本模块头部那条纪律）。不可用时交给 notes 说。
     lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses)))
+    // 信号面与推进面**同守卫**：库读不到时两者一起缺席（「读不到」不许印成「全部采到」）
+    lines.push(signalLine(starvationOf(hypotheses, now)))
   }
   if (notes.length > 0) lines.push('', '注：', ...notes.map((n) => `- ${n}`))
 
