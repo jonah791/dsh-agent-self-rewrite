@@ -13,6 +13,7 @@ import {
   resolvePolarity,
   computeDirection,
   contradictsDirection,
+  stabilityOf,
   DEFAULT_POLARITY,
   LEGACY_UNLABELED_VERDICT,
 } from '../lib/polarity.js'
@@ -256,5 +257,63 @@ describe('倾向度分档 · lean/ratio（2026-09-20 增量：让 7:1 不再与 
     const r = computeDirection(mix(3, 2), { kind: 'probe-before-action' })
     assert.equal(r.lean, 'balanced')
     assert.equal(contradictsDirection('confirm', r.direction, r.lean), true, '真混杂时必须继续报警')
+  })
+})
+
+// ── 2026-10-15 加：判定稳定性（分半复核）——论文 TEB（arXiv:2610.15055v1）噪声带本地化 ──
+// 论文实测：DeepSeek「什么都不做」（版本仍 M0）在同一批 40 个 held-out 上重评四次，
+// 分数移动 7.5 / 5.0 / 12.5 个百分点 ⇒ endpoint Gain 会把**重评方差**误当成进化。
+// 判据：「超出量在带内 ⇒ 不报为进化」。我的对应物：探针被动采证 ⇒ 没有重复测量基线 ⇒ 用确定性多重切分补上。
+
+const ev = (verdict) => ({ ts: '2026-10-01T00:00:00.000Z', kind: 'tool-failure-rate', detail: { verdict } })
+// ⚠ 用 tool-failure-rate 而不是 probe-before-action：后者的 LEGACY_UNLABELED_VERDICT 是 'violated'
+// （旧数据无标签一律推定违规）⇒ 「无标签」会被推成有方向，测不出「真 unknown」那条边界。
+// tool-failure-rate 的 legacy 是 null ⇒ 无标签 = 真未知（本套要测的正是这个语义差）。
+const TF = { kind: 'tool-failure-rate' } // violation-refutes：survived ⇒ support
+
+describe('stabilityOf · 判定稳定性（分半复核）', () => {
+  test('证据不足 ⇒ **不判**（「无法判」与「稳定」必须长得不一样）', () => {
+    const r = stabilityOf([ev('survived')], TF)
+    assert.equal(r.splits, 0)
+    assert.equal(r.unstable, false)
+    assert.ok(r.text.includes('不判'))
+    assert.ok(r.text.includes('不等于「稳定」'))
+  })
+
+  test('全体无方向标签 ⇒ 不判（先补 verdict）', () => {
+    const r = stabilityOf([{ detail: {} }, { detail: {} }], TF)
+    assert.equal(r.splits, 0)
+    assert.ok(r.text.includes('不判'))
+  })
+
+  test('方向一致 ⇒ 稳（各切分与全体一致）', () => {
+    const r = stabilityOf([ev('survived'), ev('survived'), ev('survived'), ev('survived')], TF)
+    assert.equal(r.overall, 'support')
+    assert.equal(r.unstable, false)
+    assert.deepEqual(r.directions, ['support'])
+    assert.ok(r.text.includes('稳'))
+  })
+
+  test('⚠ 反向：切分给出与全体相反的方向 ⇒ 在带内（这是本函数存在的理由）', () => {
+    // 全体 2:2 ⇒ mixed；但奇位（0,2）全 survived ⇒ support、偶位（1,3）全 violated ⇒ refute
+    const r = stabilityOf([ev('survived'), ev('violated'), ev('survived'), ev('violated')], TF)
+    assert.equal(r.overall, 'mixed')
+    assert.equal(r.unstable, true)
+    assert.ok(r.directions.includes('support') && r.directions.includes('refute'))
+    assert.ok(r.notes.some((n) => n.includes('反向')))
+    assert.ok(r.text.includes('在带内'))
+  })
+
+  test('切分后无方向 ⇒ **不算冲突**（切太小 ≠ 判定不稳）', () => {
+    const r = stabilityOf([ev('survived'), ev('survived'), { detail: {} }], TF)
+    assert.equal(r.overall, 'support')
+    assert.equal(r.unstable, false)
+  })
+
+  test('尸体：判据必须有分辨力——真冲突必不稳，全同向必稳', () => {
+    const conflict = stabilityOf([ev('survived'), ev('violated'), ev('survived'), ev('violated')], TF)
+    assert.equal(conflict.unstable, true, '真冲突必须被判不稳（这条不红 = 判据无分辨力）')
+    const consistent = stabilityOf([ev('survived'), ev('survived'), ev('survived')], TF)
+    assert.equal(consistent.unstable, false, '全同向不得被判不稳（改坏成恒不稳，这里会翻）')
   })
 })

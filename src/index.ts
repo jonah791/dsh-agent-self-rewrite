@@ -386,13 +386,20 @@ export function apply(ctx: Context, config: Config): void {
         const rows = enrich(state, args.status)
         if (rows.length === 0) return { text: '自我假设库为空——先 rewrite_hypothesis(action=add) 登记一条可证伪猜想。' }
         const suspects = rows.filter((r) => r.polaritySuspect).length
-        const head = suspects > 0 ? '⚠ 极性存疑 ' + String(suspects) + ' 条（状态标「成立」但证据方向非纯支持）\n' : ''
+        // 论文 TEB（arXiv:2610.15055v1）：超出量在噪声带内 ⇒ 不报为进化。
+        // 本引擎的对应物：判定在分半带内 ⇒ 不足以报为 finding（**只报不拦**，§2.4 判断不可代填）。
+        const unstable = rows.filter((r) => r.stability.unstable).length
+        const head = (suspects > 0 ? '⚠ 极性存疑 ' + String(suspects) + ' 条（状态标「成立」但证据方向非纯支持）\n' : '')
+          + (unstable > 0 ? '⚠ 判定在带内 ' + String(unstable) + ' 条（分半复核给出不同方向——按 TEB 判据不足以报为 finding）\n' : '')
         return {
           text: head + '自我假设库（' + String(rows.length) + '）\n' + rows.map((h) =>
             (h.status === 'finding' ? '⚠FINDING' : h.status === 'confirmed' ? '✓' : h.status === 'refuted' ? '✗' : '·')
             + ' [' + h.id + '] ' + h.statement
             + '\n   探针 ' + h.probe.kind + '（极性 ' + String(h.probe.polarity ?? '默认') + '）| 证据 ' + String(h.evidence.length) + '/' + String(h.threshold)
-            + ' | 方向 ' + h.direction.direction + '（支持 ' + String(h.direction.support) + '/反对 ' + String(h.direction.refute) + '）| ' + h.status).join('\n'),
+            + ' | 方向 ' + h.direction.direction + '（支持 ' + String(h.direction.support) + '/反对 ' + String(h.direction.refute) + '）| ' + h.status
+            + (h.stability.unstable
+              ? '\n   ⚠ ' + h.stability.text + (h.stability.notes.length > 0 ? '｜' + h.stability.notes.join('｜') : '')
+              : '')).join('\n'),
         }
       }
 

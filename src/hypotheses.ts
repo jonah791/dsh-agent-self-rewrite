@@ -24,9 +24,11 @@ import {
   computeDirection,
   contradictsDirection,
   resolvePolarity,
+  stabilityOf,
   type DirectionReport,
   type Polarity,
   type ProbeKind,
+  type StabilityReport,
 } from './polarity.js'
 import { detectCluster } from './cluster.js'
 
@@ -188,15 +190,17 @@ export interface EnrichedHypothesis extends Hypothesis {
   readonly direction: DirectionReport
   /** 状态说「成立」而证据方向非纯支持（且非「倾向支持」）⇒ 待复核指纹 */
   readonly polaritySuspect: boolean
+  /** 判定稳定性（分半复核）——论文 TEB 噪声带的本地化；`unstable` ⇒ 该判定**在带内** */
+  readonly stability: StabilityReport
 }
 
-/** 给假设附上方向判定与极性体检（列表与 finding 共用同一真源） */
+/** 给假设附上方向判定、极性体检与稳定性（列表与 finding 共用同一真源） */
 export function enrich(state: SelfTestState, status?: string): EnrichedHypothesis[] {
   const picked = status === undefined ? state.hypotheses : state.hypotheses.filter((h) => h.status === status)
   return picked.map((h) => {
     const direction = computeDirection(h.evidence, h.probe)
     const polaritySuspect = h.status === 'confirmed' && direction.direction !== 'support' && direction.lean !== 'lean-support'
-    return { ...h, direction, polaritySuspect }
+    return { ...h, direction, polaritySuspect, stability: stabilityOf(h.evidence, h.probe) }
   })
 }
 

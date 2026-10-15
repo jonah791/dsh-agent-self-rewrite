@@ -198,3 +198,96 @@ export function contradictsDirection(action: 'confirm' | 'refute', direction: Di
   }
   return (action === 'confirm' && direction === 'refute') || (action === 'refute' && direction === 'support')
 }
+
+/** 判定稳定性读数（分半复核） */
+export interface StabilityReport {
+  /** 有效切分数；证据不足或全体无方向时为 `0`（= **不判**，不是「稳定」） */
+  readonly splits: number
+  /** 各切分给出的方向（去重） */
+  readonly directions: readonly Direction[]
+  /** 全体证据给出的方向 */
+  readonly overall: Direction
+  /** 是否存在与全体不同的**有向**判定（取严：任何不同都算，含「软化」为 mixed） */
+  readonly unstable: boolean
+  /** 不稳时的分型说明（反向 / 软化 各记一行） */
+  readonly notes: readonly string[]
+  /** 人读一句话 */
+  readonly text: string
+}
+
+/** 确定性切分（**不用随机**：纯函数、可离线证伪、同输入必同输出） */
+const SPLITS: readonly { readonly name: string; readonly pick: (n: number) => readonly number[] }[] = [
+  { name: '前半', pick: (n) => Array.from({ length: Math.floor(n / 2) }, (_, i) => i) },
+  { name: '后半', pick: (n) => Array.from({ length: n - Math.floor(n / 2) }, (_, i) => i + Math.floor(n / 2)) },
+  { name: '奇位', pick: (n) => Array.from({ length: n }, (_, i) => i).filter((i) => i % 2 === 0) },
+  { name: '偶位', pick: (n) => Array.from({ length: n }, (_, i) => i).filter((i) => i % 2 === 1) },
+  { name: '去首条', pick: (n) => Array.from({ length: n - 1 }, (_, i) => i + 1) },
+  { name: '去尾条', pick: (n) => Array.from({ length: n - 1 }, (_, i) => i) },
+]
+
+/**
+ * 判定稳定性（分半复核）——论文 TEB 的 frozen rescore band 本地化。
+ *
+ * **判据来源**：Trace Evolution Bench（arXiv:2610.15055v1）§3 的噪声带
+ * `B(a,e,s) = 100 × (max_k Succ(M⁰_k) − min_k Succ(M⁰_k))`，k = 四次**冻结重评**。
+ * 实测：DeepSeek「什么都不做」（版本仍是 M0）在同一批 40 个 held-out 上重评四次，
+ * 分数移动 **7.5 / 5.0 / 12.5 个百分点** ⇒ **endpoint Gain 单独用会把重评方差误当成进化**。
+ * 该论文的判据一句话：**「超出量在带内 ⇒ 不报为进化」**。
+ *
+ * **我的对应物**：自指引擎的探针是**被动采证**，同一批证据就是全部观测 ⇒ 没有重复测量基线。
+ * 本函数补上它：对**已有证据**做**确定性多重切分**（前后半 / 奇偶位 / 去首尾条），
+ * 各切分独立算方向 ⇒ 任一切分给出**不同的有向判定**，这条假设的判定就**在带内**。
+ *
+ * ⚠ 三条刻意的边界：
+ * - **证据不足 ⇒ 不判**（`splits: 0`）——**不许把「无法判」当成「稳定」**（2026-10-15 教训：
+ *   「落点为空」曾被静默读成结论；同一失效模式在判定层重演会同样致命）；
+ * - **`unknown` 不算冲突**：切分后没证据是「切太小」，不是「判定不稳」——两者分开报；
+ * - **只报不拦**：不改裁决，只把「这条判定稳不稳」摆到主体眼前（§2.4 判断不可代填）。
+ */
+export function stabilityOf(
+  evidence: readonly { detail?: unknown }[],
+  probe: { kind: ProbeKind; polarity?: Polarity } | undefined,
+): StabilityReport {
+  const overall = computeDirection(evidence, probe)
+  const n = evidence.length
+  if (n < 2 || overall.direction === 'unknown') {
+    const why = n < 2
+      ? `证据 ${n} 条，不足 2 条无法分半`
+      : '全体证据无方向标签（先补 verdict）'
+    return {
+      splits: 0,
+      directions: [],
+      overall: overall.direction,
+      unstable: false,
+      notes: [],
+      text: `稳定性：**不判**（${why}）——「无法判」不等于「稳定」`,
+    }
+  }
+
+  const seen = new Map<Direction, string[]>()
+  for (const s of SPLITS) {
+    const idx = s.pick(n)
+    if (idx.length === 0) continue
+    const sub = computeDirection(idx.map((i) => evidence[i] as { detail?: unknown }), probe)
+    if (sub.direction === 'unknown') continue // 切分后无方向 ⇒ 不算冲突（切太小）
+    const list = seen.get(sub.direction) ?? []
+    list.push(s.name)
+    seen.set(sub.direction, list)
+  }
+
+  const directions = [...seen.keys()]
+  const others = directions.filter((d) => d !== overall.direction)
+  // 取严：任何不同都算不稳；但分型留痕——「反向」与「软化」代价不同
+  const reversed = others.filter((d) => d !== 'mixed')
+  const softened = others.filter((d) => d === 'mixed')
+  const notes: string[] = []
+  for (const d of reversed) notes.push(`⚠ 反向：${(seen.get(d) ?? []).join('/')} 判为 ${d}（全体为 ${overall.direction}）`)
+  for (const d of softened) notes.push(`软化：${(seen.get(d) ?? []).join('/')} 判为 mixed（全体为 ${overall.direction}）`)
+  const unstable = others.length > 0
+
+  const text = unstable
+    ? `稳定性：**在带内**（${String(SPLITS.length)} 次切分里 ${String(others.length)} 种给出不同判定）⇒ 该判定不足以报为 finding`
+    : `稳定性：稳（${String(directions.length)} 种切分与全体一致）`
+
+  return { splits: SPLITS.length, directions, overall: overall.direction, unstable, notes, text }
+}
