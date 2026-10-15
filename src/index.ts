@@ -36,6 +36,7 @@ import { applyBlockSet, applyRuleUpsertWithRecycle, MANAGED_BLOCKS, RECYCLE_POIN
 import {
   addHypothesis,
   applyVerdict,
+  purgeHypothesis,
   fulfillHypothesis,
   backupsDir,
   enrich,
@@ -364,10 +365,11 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ② rewrite_hypothesis ----------
   ctx.tools.register(tool({
     name: 'rewrite_hypothesis',
-    description: '自我假设库：action=add 登记一条可证伪假设（插件在真实工具调用中被动采证）/ fulfill 兑现一条使能型声明 / refine 细化判据后重新采证 / archive 淘汰 / list 列出（含方向判定与极性体检）。⚠ 使能型声明（add 时给 deps）：用于「改日志、修判据」一类**不改变即时读数**却让后续诊断成为可能的改动——它不进 active、不靠证据，靠依赖路径兑现；未兑现的会出现在 rewrite_status 的承诺面。',
+    description: '自我假设库：action=add 登记一条可证伪假设（插件在真实工具调用中被动采证）/ fulfill 兑现一条使能型声明 / refine 细化判据后重新采证 / archive 淘汰（**保留条目**，只改状态）/ purge **永久删除**（默认干跑；用于清理验收探针——它们会污染「最后采证」读数）/ list 列出（含方向判定与极性体检）。⚠ 使能型声明（add 时给 deps）：用于「改日志、修判据」一类**不改变即时读数**却让后续诊断成为可能的改动——它不进 active、不靠证据，靠依赖路径兑现；未兑现的会出现在 rewrite_status 的承诺面。',
     parameters: {
-      action: { type: 'string', description: 'add（缺省）| fulfill | refine | archive | list' },
-      id: { type: 'string', description: 'fulfill / refine / archive 时的假设 id' },
+      action: { type: 'string', description: 'add（缺省）| fulfill | refine | archive | purge | list' },
+      id: { type: 'string', description: 'fulfill / refine / archive / purge 时的假设 id' },
+      apply: { type: 'boolean', description: 'purge：缺省 false = 干跑只报将删什么；true 才真删（删数据不可逆，会留痕到 purge-trace.jsonl）' },
       statement: { type: 'string', description: 'add：可证伪陈述' },
       prediction: { type: 'string', description: 'add：可观测预测（使能型声明无可观测预测 ⇒ 填「（使能型声明）」占位）' },
       kind: { type: 'string', description: 'add：探针类型 tool-failure-rate | read-repeat | plan-before-action | probe-before-action | claim-vs-evidence | enabling（给 deps 时缺省即 enabling）' },
@@ -381,7 +383,7 @@ export function apply(ctx: Context, config: Config): void {
       resolution: { type: 'string', description: 'fulfill / refine / archive：说明' },
     },
     output: textOut,
-    async execute(args: { action?: string; id?: string; statement?: string; prediction?: string; kind?: string; threshold?: number; polarity?: string; status?: string; newStatement?: string; newThreshold?: number; resolution?: string; deps?: string[]; refs?: string[] }) {
+    async execute(args: { action?: string; id?: string; statement?: string; prediction?: string; kind?: string; threshold?: number; polarity?: string; status?: string; newStatement?: string; newThreshold?: number; resolution?: string; deps?: string[]; refs?: string[]; apply?: boolean }) {
       const action = (args.action ?? 'add').trim()
       const state = requireHypotheses(paths)
 
@@ -426,6 +428,41 @@ export function apply(ctx: Context, config: Config): void {
         h.resolution = args.resolution ?? 'archived'
         saveHypotheses(paths, state)
         return { text: '已淘汰 [' + h.id + ']（archived）' }
+      }
+
+      if (action === 'purge') {
+        if (args.id === undefined) return { text: 'purge 需要 id' }
+        const target = state.hypotheses.find((x) => x.id === args.id)
+        if (target === undefined) return { text: '假设不存在：' + args.id }
+        const evCount = (target.evidence ?? []).length
+        // 删数据不可逆（§2.2 三类之一）⇒ **默认干跑**：先看清影响面，再显式 apply。
+        if (args.apply !== true) {
+          return {
+            text: '干跑（未改动）：将**永久删除** [' + target.id + ']（' + target.status + '，证据 ' + String(evCount) + ' 条）\n  '
+              + target.statement.slice(0, 160)
+              + '\n  用途：清理**验收探针**——它们的证据会污染「最后采证」读数（取最大值，不可回退）。'
+              + '\n  真实假设不该删（证据是历史）；确认后加 apply=true 执行。',
+          }
+        }
+        const removed = purgeHypothesis(state, args.id)
+        if (removed === null) return { text: '删除失败：假设不存在（并发改动？）：' + args.id }
+        saveHypotheses(paths, state)
+        const tracePath = join(dirname(paths.selfTestFile), 'purge-trace.jsonl')
+        let traced = false
+        try {
+          appendFileSync(tracePath, JSON.stringify({
+            at: new Date().toISOString(), id: removed.id, status: removed.status,
+            evidence: (removed.evidence ?? []).length, statement: removed.statement,
+          }) + '\n', 'utf8')
+          traced = true
+        } catch {
+          // 留痕失败**不阻断**删除（观测不反噬 §5.22）——但必须在返回值里说，否则「删了没留痕」无人知
+          traced = false
+        }
+        return {
+          text: '已永久删除 [' + removed.id + ']（含证据 ' + String((removed.evidence ?? []).length) + ' 条）'
+            + '｜留痕：' + (traced ? tracePath : '⚠ 写失败（删除已完成，但留痕缺失）'),
+        }
       }
 
       if (action === 'refine') {

@@ -227,6 +227,27 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
   return { hypothesis: h, direction, polarityWarning, emptyRefuteWarning, needsWiring }
 }
 
+/**
+ * 永久移除一条假设（含其证据）。
+ *
+ * 为什么需要（t-83ddd5f6）：为验收而造的探针假设会**污染读数面**——它们的证据一旦被采到，
+ * `stalenessOf` 的「最后采证」会被刷成「今天」（取最大值，**不可回退**），而那个读数存在的
+ * 理由正是抓「采证链停」。清理手段缺位时，造一次验收数据 = 永久牺牲一个诊断读数。
+ *
+ * 与 `archive` 的分工：archive **保留条目**（只改状态）；purge **真删**。因此 purge 只该用于
+ * **从未参与真实采证**的条目（验收探针 / 误登记）——真实假设的证据是历史，不该删。
+ * 删数据不可逆 ⇒ 工具面**默认干跑**，且必须留痕（见 `index.ts` 的 purge 分支）。
+ * @param state - 假设库状态（就地修改）。
+ * @param id - 目标假设 id。
+ * @returns 被移除的假设；未命中 ⇒ `null`。
+ */
+export function purgeHypothesis(state: SelfTestState, id: string): Hypothesis | null {
+  const idx = state.hypotheses.findIndex((x) => x.id === id)
+  if (idx < 0) return null
+  const [removed] = state.hypotheses.splice(idx, 1)
+  return removed ?? null
+}
+
 export interface FulfillInput {
   readonly id: string
   /** 兑现的证据指针（`path:line` / 提交号 / 工具名）——兑现是**事实**，要能指认 */

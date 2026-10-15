@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { applyBlockSet, applyRuleUpsert, buildBlock, byteLength, extractBlockInner, findBlock, MANAGED_BLOCKS } from '../lib/wiring.js'
-import { addHypothesis, applyVerdict, enrich, recordEvidence, requireHypotheses, saveHypotheses } from '../lib/hypotheses.js'
+import { addHypothesis, applyVerdict, enrich, purgeHypothesis, recordEvidence, requireHypotheses, saveHypotheses } from '../lib/hypotheses.js'
 import { buildTaskPrompt, extractRules } from '../lib/rounds.js'
 import { resolveLegacyPaths } from '../lib/store.js'
 
@@ -135,6 +135,27 @@ test('对照组：refute 且**有**证据 ⇒ 无护栏提示（判据不误伤�
   const out = applyVerdict(state, { id: h.id, verdict: 'refute' })
   assert.equal(out.emptyRefuteWarning, null)
   assert.ok(!out.hypothesis.resolution.includes('零证据'))
+})
+
+test('purgeHypothesis：真删（含证据）并返回被删条目；未命中 ⇒ null', () => {
+  const state = { hypotheses: [] }
+  const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
+  recordEvidence(h, { ts: 't', kind: 'read-repeat', detail: {} })
+  assert.equal(state.hypotheses.length, 1)
+  const removed = purgeHypothesis(state, h.id)
+  assert.equal(removed.id, h.id)
+  assert.equal(removed.evidence.length, 1, '返回体要带着证据条数——删数据必须能说清删了什么')
+  assert.equal(state.hypotheses.length, 0)
+  assert.equal(purgeHypothesis(state, h.id), null, '未命中 ⇒ null（不抛错，也不假成功）')
+})
+
+test('尸体：purge 只删目标，不误伤邻居（id 精确匹配 + 顺序保持）', () => {
+  const state = { hypotheses: [] }
+  const a = addHypothesis(state, { statement: 'A', prediction: 'p', kind: 'read-repeat', threshold: 1 }).hypothesis
+  const b = addHypothesis(state, { statement: 'B', prediction: 'p', kind: 'read-repeat', threshold: 1 }).hypothesis
+  const c = addHypothesis(state, { statement: 'C', prediction: 'p', kind: 'read-repeat', threshold: 1 }).hypothesis
+  purgeHypothesis(state, b.id)
+  assert.deepEqual(state.hypotheses.map((x) => x.id), [a.id, c.id], '邻居不动、顺序保持')
 })
 
 test('enrich：confirmed 但方向非纯支持 ⇒ 标极性存疑（待复核指纹）', () => {
