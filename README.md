@@ -20,9 +20,9 @@
 | 状态聚合读侧 `src/status.ts` | 已落地 + 尸体测试 |
 | 假设与裁决 `src/hypotheses.ts` · 探针引擎 `src/probes.ts` · 账本与轮次 `src/rounds.ts` | 已落地 + 测试 |
 | 移植模块（`polarity` / `probe` / `burst` / `failure-rate` / `claim-evidence` / `cluster` / `ledger-store` / `parent` / `orphans` / `workspace-reset` / `presets` / `evaluator` / `types`） | 已移植，**零改动编译通过、零漂移全绿** |
-| 工具面 6 个（`rewrite_status` / `rewrite_hypothesis` / `rewrite_verdict` / `rewrite_evaluate` / `rewrite_commit` / `rewrite_history`） | 已落地 + **181/181 测试** |
+| 工具面 6 个（`rewrite_status` / `rewrite_hypothesis` / `rewrite_verdict` / `rewrite_evaluate` / `rewrite_commit` / `rewrite_history`） | 已落地 + **226/226 测试**（v0.6.0） |
 
-⚠ **尚未挂载**：挂载与旧两件退役是组合变更，需预检 + 重启。
+**已挂载**（web profile）。v0.6.0 起带**使能型声明**：给 `rewrite_hypothesis(action=add)` 传 `deps` 即登记一条「**不改变即时读数、但支撑后续动作**」的改动（论文 `arXiv:2610.14625v1` §3.6 的维度失配），状态停在 `pending`（**不进 active** ⇒ 探针不采它、不污染采证链与信号面），兑现走 `action=fulfill`，未兑现在 `rewrite_status` 的**承诺面**浮出。
 
 ## 能力（计划中的工具面 14 → 6）
 

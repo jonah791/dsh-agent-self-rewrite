@@ -59,9 +59,12 @@ describe('resolvePolarity · 极性解析（显式声明优先，否则按探针
     assert.equal(resolvePolarity(undefined), 'violation-refutes')
     assert.equal(resolvePolarity({ kind: 'no-such-kind' }), 'violation-refutes')
   })
-  test('默认表覆盖全部五族（防新增探针漏配）', () => {
-    assert.equal(Object.keys(DEFAULT_POLARITY).length, 5)
-    assert.equal(Object.keys(LEGACY_UNLABELED_VERDICT).length, 5)
+  test('默认表覆盖全部探针族（防新增探针漏配）', () => {
+    // 判据形态：断言**两张表键集一致**（而不是数字）——数字判据每加一族就要改一次，
+    // 而「漏配」的真实形状是「一张表配了、另一张没配」。
+    const kinds = Object.keys(DEFAULT_POLARITY)
+    assert.ok(kinds.length >= 5, '至少覆盖历史五族')
+    assert.deepEqual(Object.keys(LEGACY_UNLABELED_VERDICT).sort(), [...kinds].sort(), '两张表必须同键集')
   })
 })
 

@@ -83,6 +83,13 @@ export interface AddHypothesisInput {
   readonly source?: string
   /** 探针参数（未给的键不写入——保持与旧数据的形状一致） */
   readonly probeParams?: Partial<Probe>
+  /**
+   * 使能型声明：给了它就走 `pending`（待兑现）路径，**不进 `active`**。
+   *
+   * 用途见 `store.ts` 的 `Hypothesis.enabling`（论文 §3.6 的维度失配）。
+   * `deps` 必填且非空——它是这条声明**唯一的可证伪判据**：空 deps 会让它变成永真声明。
+   */
+  readonly enabling?: { readonly deps: readonly string[] }
 }
 
 export interface AddHypothesisResult {
@@ -93,6 +100,16 @@ export interface AddHypothesisResult {
 
 /** 登记一条假设（极性**物化进数据**：显式声明优先，否则取该探针的默认值并写入） */
 export function addHypothesis(state: SelfTestState, input: AddHypothesisInput, now: Date = new Date()): AddHypothesisResult {
+  // 使能型声明的护栏：`deps` 必填且非空——空 deps 会让它变成**永真声明**（没有可证伪判据）。
+  // 宁可拒绝登记，不可产出无法被证伪的声明（与 id 唯一性护栏同一条纪律）。
+  if (input.enabling !== undefined) {
+    const deps = input.enabling.deps
+    const bad = !Array.isArray(deps) || deps.length === 0
+      || deps.some((d) => typeof d !== 'string' || d.trim().length === 0)
+    if (bad) {
+      throw new Error('使能型声明必须指认依赖路径（enabling.deps = 非空字符串数组）——空 deps 会让它成为永真声明')
+    }
+  }
   const probe: Probe = { kind: input.kind, polarity: input.polarity ?? resolvePolarity({ kind: input.kind }) }
   const p = input.probeParams ?? {}
   if (p.tool !== undefined) probe.tool = p.tool
@@ -117,12 +134,14 @@ export function addHypothesis(state: SelfTestState, input: AddHypothesisInput, n
     prediction: input.prediction,
     probe,
     threshold: input.threshold,
-    status: 'active',
+    // 使能型声明停在 `pending`（待兑现）：**不进 active** ⇒ 探针不采它、不污染采证链读数
+    status: input.enabling !== undefined ? 'pending' : 'active',
     evidence: [],
     createdAt: iso,
     updatedAt: iso,
     source: input.source ?? 'alice',
   }
+  if (input.enabling !== undefined) hypothesis.enabling = { deps: [...input.enabling.deps] }
   state.hypotheses.push(hypothesis)
   return { hypothesis, clusterNote }
 }
@@ -184,6 +203,40 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
     h.resolution = input.resolution ?? 'refined, re-collecting evidence'
   }
   return { hypothesis: h, direction, polarityWarning, needsWiring }
+}
+
+export interface FulfillInput {
+  readonly id: string
+  /** 兑现的证据指针（`path:line` / 提交号 / 工具名）——兑现是**事实**，要能指认 */
+  readonly refs?: readonly string[]
+  readonly note?: string
+}
+
+/**
+ * 兑现一条使能型声明：`pending` → `confirmed`，并记下兑现时刻与指针。
+ *
+ * **只改状态**（与 `applyVerdict` 同一条纪律：布线由调用方决定）。
+ *
+ * ⚠ 三条守卫，都是刻意的：
+ * - 非使能型声明 ⇒ 抛错（普通假设走 `applyVerdict`，两条路不混）；
+ * - 非 `pending` ⇒ 抛错（`active`/`finding` 不是待兑现态，重复兑现要响亮失败而非静默覆盖）；
+ * - 兑现是**记事实**不是**做判断**（§2.4：判断不可代填）——本函数只记录，不判定「这条算不算兑现」。
+ */
+export function fulfillHypothesis(state: SelfTestState, input: FulfillInput, now: Date = new Date()): Hypothesis {
+  const h = state.hypotheses.find((x) => x.id === input.id)
+  if (h === undefined) throw new Error(`假设不存在：${input.id}`)
+  if (h.enabling === undefined) throw new Error(`不是使能型声明，不能兑现：${input.id}（普通假设用 rewrite_verdict 裁决）`)
+  if (h.status !== 'pending') throw new Error(`只有 pending 的使能型声明可以兑现（当前状态：${h.status}）`)
+  const iso = now.toISOString()
+  h.enabling = {
+    deps: h.enabling.deps,
+    fulfilledAt: iso,
+    ...(input.refs !== undefined && input.refs.length > 0 ? { fulfilledRefs: [...input.refs] } : {}),
+  }
+  h.status = 'confirmed'
+  h.updatedAt = iso
+  h.resolution = input.note ?? 'enabling fulfilled'
+  return h
 }
 
 export interface EnrichedHypothesis extends Hypothesis {

@@ -18,9 +18,9 @@ const fail = (reason, detail = 'x') => ({ ok: false, reason, detail })
 
 const h = (status) => ({ id: `h-${status}-${Math.random()}`, statement: 's', prediction: 'p', status, threshold: 3, probe: {}, evidence: [] })
 
-test('countHypotheses：四态分类，未知状态进 other（不猜不吞）', () => {
+test('countHypotheses：五态分类，未知状态进 other（不猜不吞）', () => {
   const c = countHypotheses([h('active'), h('active'), h('finding'), h('confirmed'), h('refuted'), h('weird')])
-  assert.deepEqual(c, { hypotheses: 6, active: 2, findings: 1, confirmed: 1, refuted: 1, other: 1 })
+  assert.deepEqual(c, { hypotheses: 6, active: 2, findings: 1, confirmed: 1, refuted: 1, pending: 0, other: 1 })
 })
 
 test('countAnchors：账本不可读 ⇒ null（**不是 0**——「没有锚点」与「读不到账本」是两件事）', () => {
@@ -77,14 +77,14 @@ test('空假设库 ⇒ 明说「猜想环当前无内容」，而不是沉默', 
 test('未知状态计数出现时，注里如实披露（不静默归类）', () => {
   const r = buildStatus({ selfTest: ok({ hypotheses: [h('weird'), h('weird')] }), ledger: ok({ resources: {} }), runs: [] })
   assert.equal(r.counts.other, 2)
-  assert.ok(r.notes.some((n) => n.includes('2 条假设的状态不在已知四态内')))
+  assert.ok(r.notes.some((n) => n.includes('2 条假设的状态不在 active/finding/confirmed/refuted/pending 五态内')))
 })
 
 test('真实语料形状：32 条全终态 ⇒ active/finding 均为 0，计数与文本一致', () => {
   const hypotheses = [...Array(13).fill(0).map(() => h('confirmed')), ...Array(19).fill(0).map(() => h('refuted'))]
   const r = buildStatus({ selfTest: ok({ hypotheses }), ledger: fail('missing'), runs: [] })
-  assert.deepEqual(r.counts, { hypotheses: 32, active: 0, findings: 0, confirmed: 13, refuted: 19, other: 0, anchors: null, runs: 0, unclosed: 0 })
-  assert.ok(r.text.includes('假设：32 条（active 0 / finding 0 / confirmed 13 / refuted 19）'))
+  assert.deepEqual(r.counts, { hypotheses: 32, active: 0, findings: 0, confirmed: 13, refuted: 19, pending: 0, other: 0, anchors: null, runs: 0, unclosed: 0 })
+  assert.ok(r.text.includes('假设：32 条（active 0 / finding 0 / confirmed 13 / refuted 19 / pending 0）'))
   // 2026-10-03 修正：空目录与「跑了但都收尾了」必须长得不一样（不许都报「未收尾 0」）
   assert.ok(r.notes.some((n) => n.includes('runs 目录为空')))
 })

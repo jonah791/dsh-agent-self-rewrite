@@ -23,7 +23,7 @@
  * 纯模块：无 IO、无时间依赖，便于离线单测（tests/polarity.test.mjs）。
  */
 
-export type ProbeKind = 'tool-failure-rate' | 'read-repeat' | 'plan-before-action' | 'probe-before-action' | 'claim-vs-evidence'
+export type ProbeKind = 'tool-failure-rate' | 'read-repeat' | 'plan-before-action' | 'probe-before-action' | 'claim-vs-evidence' | 'enabling'
 
 /** 探针层事件方向（canonical 字段 = 证据 `detail.verdict`） */
 export type EventVerdict = 'violated' | 'survived'
@@ -62,6 +62,9 @@ export const DEFAULT_POLARITY: Record<ProbeKind, Polarity> = {
   'plan-before-action': 'violation-refutes',
   'probe-before-action': 'violation-refutes',
   'claim-vs-evidence': 'violation-refutes',
+  // 使能型声明没有探针事件（不进 active ⇒ `probes.ts` 的 `activeOf` 天然不采它）；
+  // 此条目只为满足 `Record` 的完整性，不会被消费。
+  'enabling': 'violation-refutes',
 }
 
 /**
@@ -77,6 +80,8 @@ export const LEGACY_UNLABELED_VERDICT: Record<ProbeKind, EventVerdict | null> = 
   'plan-before-action': 'violated',
   'probe-before-action': 'violated',
   'claim-vs-evidence': null,
+  // 使能型声明不产生探针事件 ⇒ 没有可推定的历史方向（诚实留白，不猜）。
+  'enabling': null,
 }
 
 /** 从证据 detail 读事件方向：认 canonical `verdict`，兼容旧 `kind` 字段（probe-before-action 曾用此字段） */

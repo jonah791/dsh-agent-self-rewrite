@@ -36,6 +36,7 @@ import { applyBlockSet, applyRuleUpsertWithRecycle, MANAGED_BLOCKS, RECYCLE_POIN
 import {
   addHypothesis,
   applyVerdict,
+  fulfillHypothesis,
   backupsDir,
   enrich,
   requireHypotheses,
@@ -363,22 +364,24 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ② rewrite_hypothesis ----------
   ctx.tools.register(tool({
     name: 'rewrite_hypothesis',
-    description: '自我假设库：action=add 登记一条可证伪假设（插件在真实工具调用中被动采证）/ refine 细化判据后重新采证 / archive 淘汰 / list 列出（含方向判定与极性体检）。',
+    description: '自我假设库：action=add 登记一条可证伪假设（插件在真实工具调用中被动采证）/ fulfill 兑现一条使能型声明 / refine 细化判据后重新采证 / archive 淘汰 / list 列出（含方向判定与极性体检）。⚠ 使能型声明（add 时给 deps）：用于「改日志、修判据」一类**不改变即时读数**却让后续诊断成为可能的改动——它不进 active、不靠证据，靠依赖路径兑现；未兑现的会出现在 rewrite_status 的承诺面。',
     parameters: {
-      action: { type: 'string', description: 'add（缺省）| refine | archive | list' },
-      id: { type: 'string', description: 'refine / archive 时的假设 id' },
+      action: { type: 'string', description: 'add（缺省）| fulfill | refine | archive | list' },
+      id: { type: 'string', description: 'fulfill / refine / archive 时的假设 id' },
       statement: { type: 'string', description: 'add：可证伪陈述' },
-      prediction: { type: 'string', description: 'add：可观测预测' },
-      kind: { type: 'string', description: 'add：探针类型 tool-failure-rate | read-repeat | plan-before-action | probe-before-action | claim-vs-evidence' },
-      threshold: { type: 'number', description: 'add：finding 证据阈值（缺省插件配置）' },
+      prediction: { type: 'string', description: 'add：可观测预测（使能型声明无可观测预测 ⇒ 填「（使能型声明）」占位）' },
+      kind: { type: 'string', description: 'add：探针类型 tool-failure-rate | read-repeat | plan-before-action | probe-before-action | claim-vs-evidence | enabling（给 deps 时缺省即 enabling）' },
+      threshold: { type: 'number', description: 'add：finding 证据阈值（缺省插件配置；使能型声明不靠证据 ⇒ 填 0）' },
       polarity: { type: 'string', description: 'violation-refutes（主张「我会做 X」）| violation-supports（「我倾向做 X」）；不填按探针取默认并写入数据' },
-      status: { type: 'string', description: 'list：状态过滤' },
+      deps: { type: 'array', description: 'add（使能型声明）：这条改动支撑的后续动作，**必填且非空**——它是该声明唯一的可证伪判据（空 deps 会被拒登记，因为会变成永真声明）', items: { type: 'string' } },
+      refs: { type: 'array', description: 'fulfill：兑现的证据指针（path:line / 提交号 / 工具名）', items: { type: 'string' } },
+      status: { type: 'string', description: 'list：状态过滤（active | finding | confirmed | refuted | archived | pending）' },
       newStatement: { type: 'string', description: 'refine：新陈述' },
       newThreshold: { type: 'number', description: 'refine：新阈值' },
-      resolution: { type: 'string', description: 'refine / archive：说明' },
+      resolution: { type: 'string', description: 'fulfill / refine / archive：说明' },
     },
     output: textOut,
-    async execute(args: { action?: string; id?: string; statement?: string; prediction?: string; kind?: string; threshold?: number; polarity?: string; status?: string; newStatement?: string; newThreshold?: number; resolution?: string }) {
+    async execute(args: { action?: string; id?: string; statement?: string; prediction?: string; kind?: string; threshold?: number; polarity?: string; status?: string; newStatement?: string; newThreshold?: number; resolution?: string; deps?: string[]; refs?: string[] }) {
       const action = (args.action ?? 'add').trim()
       const state = requireHypotheses(paths)
 
@@ -393,7 +396,7 @@ export function apply(ctx: Context, config: Config): void {
           + (unstable > 0 ? '⚠ 判定在带内 ' + String(unstable) + ' 条（分半复核给出不同方向——按 TEB 判据不足以报为 finding）\n' : '')
         return {
           text: head + '自我假设库（' + String(rows.length) + '）\n' + rows.map((h) =>
-            (h.status === 'finding' ? '⚠FINDING' : h.status === 'confirmed' ? '✓' : h.status === 'refuted' ? '✗' : '·')
+            (h.status === 'finding' ? '⚠FINDING' : h.status === 'confirmed' ? '✓' : h.status === 'refuted' ? '✗' : h.status === 'pending' ? '⏳' : '·')
             + ' [' + h.id + '] ' + h.statement
             + '\n   探针 ' + h.probe.kind + '（极性 ' + String(h.probe.polarity ?? '默认') + '）| 证据 ' + String(h.evidence.length) + '/' + String(h.threshold)
             + ' | 方向 ' + h.direction.direction + '（支持 ' + String(h.direction.support) + '/反对 ' + String(h.direction.refute) + '）| ' + h.status
@@ -401,6 +404,17 @@ export function apply(ctx: Context, config: Config): void {
               ? '\n   ⚠ ' + h.stability.text + (h.stability.notes.length > 0 ? '｜' + h.stability.notes.join('｜') : '')
               : '')).join('\n'),
         }
+      }
+
+      if (action === 'fulfill') {
+        if (args.id === undefined) return { text: 'fulfill 需要 id' }
+        const h = fulfillHypothesis(state, {
+          id: args.id,
+          ...(args.refs !== undefined ? { refs: args.refs } : {}),
+          ...(args.resolution !== undefined ? { note: args.resolution } : {}),
+        })
+        saveHypotheses(paths, state)
+        return { text: '✓ 已兑现 [' + h.id + ']（使能型声明 → confirmed）｜依赖路径：' + (h.enabling?.deps ?? []).join(' / ') }
       }
 
       if (action === 'archive') {
@@ -428,20 +442,25 @@ export function apply(ctx: Context, config: Config): void {
         return { text: '已细化 [' + h.id + ']：判据更新，旧证据清空，重新采证' }
       }
 
-      if (args.statement === undefined || args.prediction === undefined || args.kind === undefined) {
-        return { text: 'add 需要 statement / prediction / kind' }
+      const enabling = args.deps !== undefined
+      if (args.statement === undefined || args.prediction === undefined || (args.kind === undefined && !enabling)) {
+        return { text: 'add 需要 statement / prediction / kind（使能型声明给 deps 时可省 kind）' }
       }
       const added = addHypothesis(state, {
         statement: args.statement,
         prediction: args.prediction,
-        kind: args.kind as Parameters<typeof addHypothesis>[1]['kind'],
-        threshold: args.threshold ?? config.findingThreshold,
+        kind: (enabling ? 'enabling' : args.kind) as Parameters<typeof addHypothesis>[1]['kind'],
+        threshold: args.threshold ?? (enabling ? 0 : config.findingThreshold),
         ...(args.polarity !== undefined ? { polarity: args.polarity as Parameters<typeof addHypothesis>[1]['polarity'] } : {}),
+        ...(enabling ? { enabling: { deps: args.deps ?? [] } } : {}),
       })
       saveHypotheses(paths, state)
+      const clusterSuffix = added.clusterNote.length > 0 ? '\n' + added.clusterNote : ''
       return {
-        text: '已登记 [' + added.hypothesis.id + ']（active，阈值 ' + String(added.hypothesis.threshold) + '）——插件开始被动采证。'
-          + (added.clusterNote.length > 0 ? '\n' + added.clusterNote : ''),
+        text: enabling
+          ? '已登记使能型声明 [' + added.hypothesis.id + ']（pending，待兑现）｜依赖路径：' + (args.deps ?? []).join(' / ')
+            + '\n⚠ 它**不进 active**（探针不采它，也不计入采证链读数）：兑现时 rewrite_hypothesis(action=fulfill, id=...)；未兑现的会出现在 rewrite_status 的承诺面。' + clusterSuffix
+          : '已登记 [' + added.hypothesis.id + ']（active，阈值 ' + String(added.hypothesis.threshold) + '）——插件开始被动采证。' + clusterSuffix,
       }
     },
   }))

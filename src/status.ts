@@ -38,6 +38,8 @@ export interface StatusCounts {
   readonly confirmed: number
   readonly refuted: number
   readonly other: number
+  /** 使能型声明的**待兑现**数（`pending`）——独立一档，**不并入 active**（并入会掩盖「采证链停」） */
+  readonly pending: number
   /** 账本可读时的锚点数；不可读时为 `null`（**不是 0**） */
   readonly anchors: number | null
   /** runs 目录里的**记录数**——**不是**「未收尾轮次数」（后者是 `unclosed`） */
@@ -53,23 +55,25 @@ export interface StatusReport {
   readonly text: string
 }
 
-/** 假设库里的四种已知终态之外的都归 `other`（不猜、不吞） */
-const KNOWN = new Set(['active', 'finding', 'confirmed', 'refuted'])
+/** 假设库里的已知状态之外的都归 `other`（不猜、不吞） */
+const KNOWN = new Set(['active', 'finding', 'confirmed', 'refuted', 'pending'])
 
 export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusCounts, 'anchors' | 'runs' | 'unclosed'> {
   let active = 0
   let findings = 0
   let confirmed = 0
   let refuted = 0
+  let pending = 0
   let other = 0
   for (const h of hypotheses) {
     if (h.status === 'active') active += 1
     else if (h.status === 'finding') findings += 1
     else if (h.status === 'confirmed') confirmed += 1
     else if (h.status === 'refuted') refuted += 1
+    else if (h.status === 'pending') pending += 1
     else other += 1
   }
-  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, other }
+  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, pending, other }
 }
 
 /** 账本可读 ⇒ 锚点总数；不可读 ⇒ `null`（区分「没有锚点」与「读不到账本」） */
@@ -148,7 +152,9 @@ export function stalenessOf(hypotheses: readonly Hypothesis[], now: Date): Stale
   let collecting = 0
   for (const h of hypotheses) {
     if (h.status === 'active') collecting += 1
-    if (h.status === 'confirmed' && typeof h.updatedAt === 'string' && h.updatedAt.length > 0) {
+    // ⚠ 只数**普通** confirmed：使能型声明兑现后也是 confirmed，但它不是「布线」——
+    // 计入会让「最后布线」看起来比实际新（假活读数，而这一面存在的理由正是抓假活）。
+    if (h.status === 'confirmed' && h.enabling === undefined && typeof h.updatedAt === 'string' && h.updatedAt.length > 0) {
       if (lastWired === null || Date.parse(h.updatedAt) > Date.parse(lastWired)) lastWired = h.updatedAt
     }
     for (const ev of h.evidence ?? []) {
@@ -204,6 +210,42 @@ export function advanceQueue(hypotheses: readonly Hypothesis[]): readonly Advanc
       }
     })
     .sort((a, b) => (a.gapRatio === b.gapRatio ? b.evidence - a.evidence : a.gapRatio - b.gapRatio))
+}
+
+/** 承诺面的一行：一条待兑现的使能型声明 */
+export interface PromiseRow {
+  readonly id: string
+  readonly statement: string
+  /** 它支撑的后续动作（登记时必填——该声明唯一的可证伪判据） */
+  readonly deps: readonly string[]
+  /** 登记至今的天数（向下取整）；解析不出 ⇒ `null` */
+  readonly ageDays: number | null
+}
+
+/**
+ * 承诺面：**待兑现的使能型声明**。
+ *
+ * 判据来源：论文 `arXiv:2610.14625v1` §3.6——改日志、修判据一类改动**不改变即时读数**，
+ * 用即时分数验收会把它们判成「无收益」而丢弃，从而失去它们支撑的后续修复
+ * （论文的例子：改日志让下一轮能看出日期格式问题，但该改动本身不加分）。
+ * 本面的职责是让**未兑现**的声明浮出来（兑现记录在 `Hypothesis.enabling.fulfilledAt`）。
+ *
+ * ⚠ 三条刻意的边界：
+ * - **不设到期日**——「登记时填时效」的形态已被 `reviewAfter` 的零填写实测证伪
+ *   （全库 0/1975）；只报**年龄**，兑现还是放弃由主体裁（§2.4 判断不可代填）；
+ * - **只列 `pending`**：已兑现与已放弃的不占版面（它们各有自己的读数）；
+ * - 年龄算不出 ⇒ `null`（「不知道」不是「今天刚登记」）。
+ */
+export function promisesOf(hypotheses: readonly Hypothesis[], now: Date): readonly PromiseRow[] {
+  return hypotheses
+    .filter((h) => h.status === 'pending' && h.enabling !== undefined)
+    .map((h) => ({
+      id: h.id,
+      statement: h.statement,
+      deps: h.enabling?.deps ?? [],
+      ageDays: daysSince(h.createdAt, now),
+    }))
+    .sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1))
 }
 
 /** 某一类探针的采证落点统计 */
@@ -266,6 +308,9 @@ export function starvationOf(hypotheses: readonly Hypothesis[], now: Date): Star
   let confirmedWithoutEvidence = 0
 
   for (const h of hypotheses) {
+    // ⚠ 使能型声明天然零证据（它不靠证据，靠依赖路径兑现）⇒ 计入会把信号面污染成「恒有饥饿」，
+    // 而这一面存在的理由正是分辨「请求了 N 条、落点 0 条」的真饥饿。
+    if (h.status === 'pending') continue
     const kind = typeof h.probe?.kind === 'string' && h.probe.kind.length > 0 ? h.probe.kind : '(未标探针)'
     const slot = perProbe.get(kind) ?? { total: 0, zero: 0, oldest: null }
     slot.total += 1
@@ -355,6 +400,23 @@ function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
 }
 
 /**
+ * 承诺面的渲染。
+ *
+ * ⚠ 三态不许同貌：**无待兑现** ⇒ 明说「无」（这可能是好读数——都兑现了，或从未登记过）；
+ * **有待兑现** ⇒ 给条数、最老年龄与**依赖路径**（一眼看出它在等什么，而不是只有一串 id）。
+ */
+function promiseLine(rows: readonly PromiseRow[]): string {
+  if (rows.length === 0) return '承诺面：无待兑现的使能型声明'
+  const oldest = rows.reduce<number | null>(
+    (acc, r) => (r.ageDays === null ? acc : acc === null || r.ageDays > acc ? r.ageDays : acc),
+    null,
+  )
+  const head = `承诺面：待兑现 ${String(rows.length)} 条${oldest === null ? '' : `（最老 ${String(oldest)} 天）`}`
+  const list = rows.slice(0, 3).map((r) => `${r.id} → ${r.deps.join(' / ')}`)
+  return head + `\n  依赖路径：${list.join(' · ')}`
+}
+
+/**
  * 感知圈联动的载荷（跨插件服务 `selfRewrite.snapshot()` 的返回）。
  *
  * 存在理由（2026-10-15）：停滞面建好之后，**它仍然要我主动查**——而实测停滞正是
@@ -432,7 +494,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
   } else if (base.hypotheses === 0) {
     notes.push('假设库为空：五环的「猜想」环当前无内容')
   }
-  if (base.other > 0) notes.push(`有 ${base.other} 条假设的状态不在已知四态内（active/finding/confirmed/refuted）——原样计数，未归类`)
+  if (base.other > 0) notes.push(`有 ${base.other} 条假设的状态不在 active/finding/confirmed/refuted/pending 五态内（含 archived 与未知取值）——原样计数，未归类`)
 
   const anchors = countAnchors(input.ledger)
   if (!input.ledger.ok) {
@@ -458,7 +520,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
     )
   }
   lines.push(
-    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted}${base.other ? ` / other ${base.other}` : ''}）`,
+    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / pending ${base.pending}${base.other ? ` / other ${base.other}` : ''}）`,
     `锚点：${anchorText}`,
     `runs 记录：${input.runs.length}（${statusBreakdown(input.runs)}）· 未收尾 ${unclosed}`,
   )
@@ -468,6 +530,8 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
     lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses)))
     // 信号面与推进面**同守卫**：库读不到时两者一起缺席（「读不到」不许印成「全部采到」）
     lines.push(signalLine(starvationOf(hypotheses, now)))
+    // 承诺面（使能型声明）：与上两面同守卫——库读不到时一并缺席
+    lines.push(promiseLine(promisesOf(hypotheses, now)))
   }
   if (notes.length > 0) lines.push('', '注：', ...notes.map((n) => `- ${n}`))
 

@@ -76,8 +76,8 @@ export interface Evidence {
   detail: Record<string, unknown>
 }
 
-/** 假设状态机 */
-export type HypothesisStatus = 'active' | 'finding' | 'confirmed' | 'refuted' | 'archived'
+/** 假设状态机（`pending` = 使能型声明的待兑现态，见 `Hypothesis.enabling`） */
+export type HypothesisStatus = 'active' | 'finding' | 'confirmed' | 'refuted' | 'archived' | 'pending'
 
 /**
  * 探针定义（**住数据里**）。
@@ -116,6 +116,24 @@ export interface Hypothesis {
   source?: string
   note?: string
   resolution?: string
+  /**
+   * 使能型声明（论文 `arXiv:2610.14625v1` §3.6 的维度失配）：改日志、修判据一类改动
+   * **不改变即时读数**，却让后续诊断或修复成为可能——用即时分数做验收会把它们判成「无收益」而丢弃。
+   *
+   * 与普通假设的两处不同：
+   * 1. **不靠证据阈值**（它没有可观测预测），靠**依赖路径兑现**——`deps` 是它支撑的后续动作，
+   *    登记时必填（这就是它的可证伪判据）；
+   * 2. 状态停在 `pending`（待兑现），**不进 `active`** ⇒ 探针天然不采它，
+   *    也不会污染采证链读数（否则会掩盖「采证链停」这个真问题）。
+   *
+   * 未兑现是**事后可算**的（`pending` 且无 `fulfilledAt`），不依赖登记时填到期日——
+   * 该形态已被 `reviewAfter` 的零填写实测证伪（见 `docs/design/self-evolution-domain.md` §7）。
+   */
+  enabling?: {
+    readonly deps: readonly string[]
+    fulfilledAt?: string
+    fulfilledRefs?: readonly string[]
+  }
 }
 
 export interface SelfTestState {
