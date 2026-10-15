@@ -31,7 +31,7 @@ import { EvolveStore } from './ledger-store.js'
 import type { ResourceId } from './types.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
-import { buildStatus } from './status.js'
+import { buildStatus, selfRewriteSnapshot, type SelfRewriteSnapshot } from './status.js'
 import { applyBlockSet, applyRuleUpsertWithRecycle, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
 import {
   addHypothesis,
@@ -241,6 +241,27 @@ function describeRecycle(write: RecycleWriteOutcome, archivePath: string): strin
   }
   const why = write.stopped === 'exhausted' ? '（已试回收：迁到只剩 1 条仍放不下——正文本体吃掉了全部余量）' : ''
   return describeWrite(write.outcome) + why
+}
+
+/**
+ * 自改写引擎对外服务（life-core 感知圈驱动方注入消费）——**停滞信号的送达通道**。
+ *
+ * 存在理由（2026-10-15）：引擎实测停滞 24 天而**没有入口**把它送到我眼前（同一条链上的
+ * `evolution-core` 有感知圈联动、本件没有）⇒ 只能靠我主动查 `rewrite_status`，而「没人推」
+ * 正是停滞的成因。本服务把停滞读数做成**可被拉取的载荷**（只在感知圈到期时拉一次，
+ * 不进每轮注入 ⇒ 零常驻开销）。
+ */
+export interface SelfRewriteService {
+  /** 拉一次停滞快照；库不可读 / disabled ⇒ `null`（消费方容错跳过，不报错） */
+  snapshot(): Promise<SelfRewriteSnapshot | null>
+  name: string
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** 自改写引擎服务（dsh-agent-self-rewrite 提供；可选，未挂载时消费方容错跳过） */
+    selfRewrite?: SelfRewriteService
+  }
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -625,6 +646,23 @@ export function apply(ctx: Context, config: Config): void {
       return { text: lines.join('\n') }
     },
   }))
+
+  // ---------- 跨插件服务：selfRewrite.snapshot()（life-core 感知圈联动消费） ----------
+  // 只在感知圈到期时被拉一次；库不可读 / 聚合异常一律返回 null（消费方容错跳过）。
+  // ⚠ 吞错是刻意的（§5.24：观测绝不反噬主流程）——快照失败不得影响感知圈本身。
+  ctx.provide('selfRewrite', {
+    name: 'dsh-agent-self-rewrite',
+    snapshot: async (): Promise<SelfRewriteSnapshot | null> => {
+      try {
+        const state = loadSelfTestState(paths)
+        if (!state.ok) return null
+        return selfRewriteSnapshot(state.value.hypotheses, new Date())
+      } catch (error) {
+        ctx.logger('dsh-agent-self-rewrite').warn('snapshot 聚合失败: ' + String(error))
+        return null
+      }
+    },
+  } as SelfRewriteService)
 
   ctx.effect(() => () => {
     /* ctx.on 由 cordis 自动释放 */

@@ -226,6 +226,54 @@ function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
   return head + `\n  最接近阈值（归一化缺口升序）：${top.join(' · ')}`
 }
 
+/**
+ * 感知圈联动的载荷（跨插件服务 `selfRewrite.snapshot()` 的返回）。
+ *
+ * 存在理由（2026-10-15）：停滞面建好之后，**它仍然要我主动查**——而实测停滞正是
+ * 「没人推我」的结果。`evolution-core` 有感知圈联动（life-core 到期拉它），本件没有
+ * ⇒ 同一条链上的两个引擎，一个有入口一个没有。本函数把停滞读数做成**可被拉取的载荷**。
+ *
+ * ⚠ `signal` 的判据刻意收窄（避免噪音）：**库空 ⇒ false**（新装不是停滞；「读不到」与
+ * 「空」的分型由调用方另行负责）；**库非空 ⇒ true**（要么采证链停、要么有可推进项，
+ * 两者都值得看一眼）。不设「停滞天数阈值」——那是判断，不由程序代填（§2.4）。
+ */
+export interface SelfRewriteSnapshot {
+  readonly at: string
+  readonly daysSinceWired: number | null
+  readonly daysSinceEvidence: number | null
+  readonly collecting: number
+  /** 推进队列首位（归一化缺口最小者）；无在采证假设 ⇒ `null` */
+  readonly nextUp: AdvanceRow | null
+  /** 感知圈是否该带这段（见上方判据） */
+  readonly signal: boolean
+  /** 一行摘要 */
+  readonly line: string
+  /** 需要动作时的一句（无 ⇒ `null`） */
+  readonly hint: string | null
+}
+
+export function selfRewriteSnapshot(hypotheses: readonly Hypothesis[], now: Date): SelfRewriteSnapshot {
+  const stale = stalenessOf(hypotheses, now)
+  const queue = advanceQueue(hypotheses)
+  const next = queue.length > 0 ? (queue[0] as AdvanceRow) : null
+  const wired = stale.daysSinceWired === null ? '从未布线' : `最后布线 ${String(stale.daysSinceWired)} 天前`
+  const evidence = stale.daysSinceEvidence === null ? '从未采证' : `最后采证 ${String(stale.daysSinceEvidence)} 天前`
+  const line = `${wired} · ${evidence} · 在采证 ${String(stale.collecting)} 条`
+  const hint = stale.collecting === 0
+    ? '⚠ 采证链停：没有 active 假设，探针不会积累证据 ⇒ 要推进五环，先 rewrite_hypothesis(action=add) 登记一条可证伪猜想'
+    : (next === null ? null : `最接近阈值：${next.id} ${String(next.evidence)}/${String(next.threshold)}`)
+  return {
+    at: now.toISOString(),
+    daysSinceWired: stale.daysSinceWired,
+    daysSinceEvidence: stale.daysSinceEvidence,
+    collecting: stale.collecting,
+    nextUp: next,
+    signal: hypotheses.length > 0,
+    line,
+    hint,
+  }
+}
+
 export function buildStatus(input: StatusInput, now: Date = new Date()): StatusReport {
   const notes: string[] = []
 
