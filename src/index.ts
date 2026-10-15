@@ -29,6 +29,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { EvolveStore } from './ledger-store.js'
 import { RESOURCE_IDS, type ResourceId, type ResourceSink } from './types.js'
+import { compareCandidates, describeChoice } from './candidate-choice.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
 import { buildStatus, selfRewriteSnapshot, type ArtifactStat, type SelfRewriteSnapshot } from './status.js'
@@ -244,6 +245,49 @@ export function artifactsOf(env: SinkEnv): ArtifactStat[] {
     out.push({ id, path: sink.path, bytes: readBytes(sink.path), maxBytes: sink.maxBytes })
   }
   return out
+}
+
+/**
+ * 候选选择段（P4 的**接入点**）：把最近两代的三要素喂给合成判据。
+ *
+ * ⚠ 三处刻意的诚实：
+ * - **噪声读数传 `null`**：本件每代只评测一次 ⇒ **给不出「带」**（TEB 的判据建立在四次冻结
+ *   重评之上）。于是裁决按判据如实报「不可比」——**这恰恰是想要的结论**：单次分数差
+ *   不构成选择依据（拿它选候选就是 TEB 点名的那个错）；
+ * - **阈值来自参数**：不给就报「未给判据 ⇒ 不裁」（价值取舍不代填，§2.4）；
+ * - **成本读数取轮次墙钟**（`RunState.at → doneAt`）：它是可测的代理，不是 §5.32 的时段价
+ *   （时段价是**纪律**，本件读不到）——口径写在这里，免得读者以为是时段成本。
+ */
+export function choiceLines(
+  gens: readonly { gen: number; ability?: number }[],
+  store: EvolveStore,
+  minGainPerCost: number | undefined,
+): string[] {
+  if (gens.length < 2) return ['候选选择：代不足两代 ⇒ 无从比较']
+  if (minGainPerCost === undefined) {
+    return ['候选选择：未给判据（`minGainPerCost`）⇒ **不裁**——「多少增益配得上多少代价」是价值取舍，本件不代填']
+  }
+  const runs = store.listRuns()
+  const costOf = (gen: number): number | null => {
+    const r = runs.find((x) => x.gen === gen && x.doneAt !== undefined)
+    if (r?.doneAt === undefined) return null
+    const ms = Date.parse(r.doneAt) - Date.parse(r.at)
+    return Number.isFinite(ms) && ms >= 0 ? ms : null
+  }
+  const prev = gens[gens.length - 2]
+  const cur = gens[gens.length - 1]
+  // 显式守卫：`noUncheckedIndexedAccess` 下索引类型含 undefined——逻辑上前面已保证两代，
+  // 但**类型层也要说出来**（否则 tsc 报错，而 emit 仍发生 ⇒ 测试照跑，容易漏看）
+  if (prev === undefined || cur === undefined) return ['候选选择：取不到最近两代 ⇒ 无从比较']
+  const verdict = compareCandidates(
+    { id: 'gen' + String(prev.gen), performance: prev.ability ?? null, costMs: costOf(prev.gen), noisy: null },
+    { id: 'gen' + String(cur.gen), performance: cur.ability ?? null, costMs: costOf(cur.gen), noisy: null },
+    { minGainPerCost },
+  )
+  return [
+    '候选选择（最近两代 · 三要素）：性能=评测分 · 成本=轮次墙钟（非时段价）· 噪声=**不可得**（本件每代只评测一次，给不出带）',
+    '  ' + describeChoice(verdict),
+  ]
 }
 
 /**
@@ -801,10 +845,13 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ⑥ rewrite_history ----------
   ctx.tools.register(tool({
     name: 'rewrite_history',
-    description: '履历：版本演进（代 / 版本 / 分数 / 结论）、活跃版本、锚点链、撤回记录。只读。',
-    parameters: {},
+    description: '履历：版本演进（代 / 版本 / 分数 / 结论）、活跃版本、锚点链、撤回记录、**候选选择裁决**（P4 三要素合成判据）。只读。'
+      + '⚠ 候选选择段需 `minGainPerCost`（「多少增益配得上多少代价」是**价值取舍**，本件不代填，§2.4）；不给 ⇒ 如实报「未给判据 ⇒ 不裁」。',
+    parameters: {
+      minGainPerCost: { type: 'number', description: '候选选择：性能增益 / 成本增加 的下限比（单位 性能分/毫秒）。不给 ⇒ 不裁（不代填价值取舍）' },
+    },
     output: textOut,
-    async execute() {
+    async execute(args: { minGainPerCost?: number }) {
       const view = ledgerView(store) as { generations: unknown[]; anchors: Record<string, string[]>; rollbacks: unknown[] }
       const gens = view.generations as { gen: number; version: string; ability?: number; ship?: number; releaseClass?: string; note?: string }[]
       const lines = ['履历（账本视图）', '代：' + String(gens.length)]
@@ -814,6 +861,7 @@ export function apply(ctx: Context, config: Config): void {
       }
       lines.push('锚点链：' + JSON.stringify(view.anchors))
       lines.push('撤回记录：' + String(view.rollbacks.length))
+      lines.push(...choiceLines(gens, store, args.minGainPerCost))
       return { text: lines.join('\n') }
     },
   }))
