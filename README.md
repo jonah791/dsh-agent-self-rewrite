@@ -1,8 +1,42 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: 自改写引擎：AGENTS.md 标记段的唯一写者——把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环
+  inject: ['tools', 'agents', 'subagents']
+  tools: rewrite_status,rewrite_hypothesis,rewrite_verdict,rewrite_evaluate,rewrite_commit,rewrite_history
+  runtime: host-only
+  envDeps: 见 README「配置」节
+  boundary: 见 README「设计要点」与「生效判据与回退」节
+  compat: cordis ^4.0.1 / dsh-tools >=0.1.0-rc.6
+-->
 # dsh-agent-self-rewrite — 自改写引擎
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-self-rewrite"><img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+  <img src="https://img.shields.io/badge/tests-282%20passed-brightgreen" alt="tests">
+</p>
 
 `AGENTS.md` 标记段的**唯一写者**：把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。
 
 替换 `dsh-agent-self-test` + `dsh-agent-evolve`。设计依据：`docs/plans/插件融合设计_自改写与蒸馏_2026-09-23.md`；权威契约见 [docs/semantic.md](docs/semantic.md)。
+
+## 快速开始
+
+**1) 装依赖**（在目标 profile 的 `package.json` 加 link 依赖）：
+
+```jsonc
+"dsh-agent-self-rewrite": "link:E:/alice/self-plugins/dsh-agent-self-rewrite"
+```
+
+**2) 挂组合**：
+
+```yaml
+- id: dsh-agent-self-rewrite
+  name: dsh-agent-self-rewrite
+```
+
+**3) 30 秒验证**：`rewrite_status` → 应报受管产物字节数 / 假设四态 / 锚点链 / 推进面
 
 ## 为什么需要新件（而不是把两件合并）
 
@@ -54,3 +88,11 @@
 ## 回退
 
 unmount 本件 → 把 `dsh-agent-self-test` / `dsh-agent-evolve` 从 `_archive/` 还原并重挂；数据未动（同一 `dataDir`）⇒ 无损。
+
+## 测试
+
+```bash
+cd self-plugins/dsh-agent-self-rewrite && npm test
+```
+
+**282 条用例**（跑一次得到）。
