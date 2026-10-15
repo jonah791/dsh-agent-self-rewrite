@@ -311,6 +311,22 @@ export interface RecycleResult {
   /** 迁出的条目（旧 → 新） */
   readonly recycled: readonly string[]
   readonly stopped: 'fits' | 'exhausted'
+  /** 段内仍被 `pinned` 保护的条目数（可见面：0 条与「没配保护」必须分得开） */
+  readonly pinnedRemaining: number
+}
+
+/** 可迁集合里第一条**未被保护**的条目下标；全被保护（或无条目）⇒ -1 */
+function firstUnpinned(entries: readonly string[], pinned?: (entry: string) => boolean): number {
+  if (entries.length === 0) return -1
+  if (pinned === undefined) return 0
+  for (let i = 0; i < entries.length; i++) if (!pinned(entries[i] as string)) return i
+  return -1
+}
+
+/** 段内仍受保护的条目数——保护机制**可观测**（否则「它在工作」与「它没生效」同貌） */
+function countPinned(entries: readonly string[], pinned?: (entry: string) => boolean): number {
+  if (pinned === undefined) return 0
+  return entries.filter((e) => pinned(e)).length
 }
 
 /**
@@ -318,19 +334,34 @@ export interface RecycleResult {
  *
  * `fits` 是**注入的谓词**（候选段内文本 → 是否可接受）⇒ 本函数不碰文件系统，可离线证伪。
  * 方向是刻意的：只迁最旧（新规则还在被引用），且**绝不迁空**（空段 = 该段机制失效）。
+ *
+ * `pinned`（2026-10-14 加）：受保护的条目**永不迁出**，原位保留。存在理由是一次实测——
+ * 纯 FIFO 会把「报时前必读时钟」「交付进正文」这类**高频核心纪律**一并迁走，而后果是
+ * **静默行为退化**（报告里那句还是 `stopped:'fits'`，成功）。重要性**不可由程序推断**
+ * （那是判断代填），只能由主体显式声明 ⇒ 本函数只执行声明，不猜。
+ * 全被保护而仍放不下 ⇒ 如实返回 `exhausted`，不静默放行。
  */
-export function recycleOldest(inner: string, fits: (candidateInner: string) => boolean, keep = 1): RecycleResult {
+export function recycleOldest(
+  inner: string,
+  fits: (candidateInner: string) => boolean,
+  keep = 1,
+  pinned?: (entry: string) => boolean,
+): RecycleResult {
   const head = joinEntries(splitEntries(inner))
-  if (fits(head)) return { inner: head, recycled: [], stopped: 'fits' }
+  if (fits(head)) return { inner: head, recycled: [], stopped: 'fits', pinnedRemaining: countPinned(splitEntries(inner), pinned) }
   const recycled: string[] = []
   let rest = splitEntries(inner)
   const floor = Math.max(1, Math.floor(keep))
   while (rest.length > floor) {
-    recycled.push(rest[0] as string)
-    rest = rest.slice(1)
-    if (fits(joinEntries(rest))) return { inner: joinEntries(rest), recycled, stopped: 'fits' }
+    const idx = firstUnpinned(rest, pinned)
+    if (idx === -1) break // 可迁的没了：不静默放行，交给下面按 exhausted 如实报
+    recycled.push(rest[idx] as string)
+    rest = rest.slice(0, idx).concat(rest.slice(idx + 1))
+    if (fits(joinEntries(rest))) {
+      return { inner: joinEntries(rest), recycled, stopped: 'fits', pinnedRemaining: countPinned(rest, pinned) }
+    }
   }
-  return { inner: joinEntries(rest), recycled, stopped: 'exhausted' }
+  return { inner: joinEntries(rest), recycled, stopped: 'exhausted', pinnedRemaining: countPinned(rest, pinned) }
 }
 
 /** 拼出「条目 + 指针行」；`pointerFor` 缺省时沿用 `stalePointer`（不让既有条目的可达性丢失） */
@@ -358,6 +389,14 @@ export interface RecycleWriteRequest extends UpsertRequest {
    * 但 `stopped` 报 `tight`，不谎报「已回安全区」）。
    */
   readonly reserveBytes?: number
+  /**
+   * 受保护条目的判定（2026-10-14 加）。命中的条目**永不迁出**。
+   *
+   * 存在理由是一次实测：纯 FIFO 会把「报时前必读时钟」「交付进正文」这类**高频核心纪律**
+   * 一并迁走 ⇒ 不再进每轮注入 ⇒ **静默行为退化**（而报告里那句还是 `stopped:'fits'`，成功）。
+   * 重要性**不可由程序推断**（那是判断代填）⇒ 只执行主体显式声明的保护，不猜。
+   */
+  readonly pinned?: (entry: string) => boolean
 }
 
 /** `not-needed` = 没撞线；`fits` = 迁到目标余量；`tight` = 放得下但没到目标余量；`exhausted` = 迁不动仍放不下 */
@@ -368,6 +407,8 @@ export interface RecycleWriteOutcome {
   /** 实际迁出的条目（旧 → 新）。**仅在 `outcome.ok === true` 时非空**——拒写时没有任何东西被迁走 */
   readonly recycled: readonly string[]
   readonly stopped: RecycleStop
+  /** 段内仍受保护的条目数（仅在真发生迁移时有值；可见面：0 条与「没配保护」必须分得开） */
+  readonly pinnedRemaining?: number
 }
 
 /**
@@ -410,8 +451,14 @@ export function applyRuleUpsertWithRecycle(full: string, req: RecycleWriteReques
   let fallback: { inner: string; count: number } | null = null
   let stopped: RecycleStop = 'exhausted'
   while (rest.length > keep) {
-    recycled.push(rest[0] as string)
-    rest = rest.slice(1)
+    // ⚠ **同步点**：本循环与 `recycleOldest` 同源（内联是为保住 fallback / `tight` 语义）。
+    // 两处的**预算口径本就不同**（这里含指针行、那里不含）⇒ 迁移**条数**可以不同，不必强求相等；
+    // 必须一致的是**保护语义**（受保护条目两边都不迁）——`tests/wiring-recycle.test.mjs`
+    // 有一条按此判据写的用例，正是为了让「忘了同步」响亮失败，而不是靠注释提醒。
+    const idx = firstUnpinned(rest, req.pinned)
+    if (idx === -1) break // 可迁的只剩受保护条目：不静默放行，交给下面如实报
+    recycled.push(rest[idx] as string)
+    rest = rest.slice(0, idx).concat(rest.slice(idx + 1))
     const candidate = withPointer(rest, recycled.length, req.pointerFor, stalePointer)
     const verdict = budgetOf(candidate)
     if (verdict.allowed && fallback === null) {
@@ -437,5 +484,6 @@ export function applyRuleUpsertWithRecycle(full: string, req: RecycleWriteReques
     outcome: { ok: true, action: 'added', content: next, bytes: verdict.bytes, headroom: verdict.headroom },
     recycled,
     stopped,
+    pinnedRemaining: countPinned(rest, req.pinned),
   }
 }

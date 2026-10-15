@@ -88,6 +88,14 @@ export interface Config {
   archivePath: string
   /** 回收的**目标余量**（字节）：迁到余量回到这个数才停；缺省 1024（只求「刚好放下」会让下次立刻又撞线） */
   recycleReserveBytes: number
+  /**
+   * 受保护条目的匹配子串（2026-10-14 加）：命中的条目**永不被回收迁出**。
+   *
+   * 存在理由是一次实测——纯 FIFO 会把「报时前必读时钟」「交付进正文」这类**高频核心纪律**
+   * 一并迁走，后果是**静默行为退化**（不再进每轮注入，而报告里那句还是 `stopped:'fits'`，成功）。
+   * 重要性**不可由程序推断**（那是判断代填）⇒ 只能由主体显式声明。留空 = 不保护（行为与旧版一致）。
+   */
+  pinnedPatterns: string[]
   /** 覆盖旧件 `dsh-agent-self-test` 的 dataDir（留空 ⇒ `<DSH_HOME>/agent-self-test`） */
   selfTestDataDir: string
   /** 覆盖旧件 `dsh-agent-evolve` 的 dataDir（留空 ⇒ `<DSH_HOME>/.evolve`） */
@@ -112,6 +120,7 @@ export const Config = z.object({
   rulesBlockId: z.string().default('self-test'),
   archivePath: z.string().default(''),
   recycleReserveBytes: z.number().default(1024),
+  pinnedPatterns: z.array(z.string()).default([]),
   selfTestDataDir: z.string().default(''),
   evolveDataDir: z.string().default(''),
   modeltestDir: z.string().default(''),
@@ -224,8 +233,11 @@ function describeRecycle(write: RecycleWriteOutcome, archivePath: string): strin
   if (write.outcome.ok) {
     if (write.recycled.length === 0) return describeWrite(write.outcome)
     const tight = write.stopped === 'tight' ? '；⚠ 余量仍未回到目标区（已尽力：只迁放得下所需的最少条数）' : ''
+    const kept = write.pinnedRemaining !== undefined && write.pinnedRemaining > 0
+      ? '；' + String(write.pinnedRemaining) + ' 条受保护未迁'
+      : ''
     return '已新增 1 条（余量 ' + String(write.outcome.headroom) + ' 字节）· **回收 ' + String(write.recycled.length)
-      + ' 条**最旧规则至 ' + archivePath + '（段内留指针）' + tight
+      + ' 条**最旧规则至 ' + archivePath + '（段内留指针' + kept + '）' + tight
   }
   const why = write.stopped === 'exhausted' ? '（已试回收：迁到只剩 1 条仍放不下——正文本体吃掉了全部余量）' : ''
   return describeWrite(write.outcome) + why
@@ -308,7 +320,7 @@ export function apply(ctx: Context, config: Config): void {
         ledger: loadLedger(paths),
         runs: listRuns(paths),
         rules: { path: rulesPath, bytes: readRulesBytes(rulesPath), maxBytes: config.maxBytes },
-      })
+      }, new Date())
       const lines = [report.text]
       const state = loadSelfTestState(paths)
       if (state.ok) {
@@ -439,12 +451,17 @@ export function apply(ctx: Context, config: Config): void {
         const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
         const pointerFor = (n: number): string =>
           RECYCLE_POINTER_PREFIX + ' 已回收 ' + String(n) + ' 条至 ' + relArchive + '（' + new Date().toISOString().slice(0, 10) + '）'
+        // 受保护条目：主体显式声明的一串子串（留空 ⇒ 不保护任何条目，行为与旧版逐字节一致）
+        const pinned = config.pinnedPatterns.length > 0
+          ? (entry: string): boolean => config.pinnedPatterns.some((p) => entry.includes(p))
+          : undefined
         const write = applyRuleUpsertWithRecycle(full, {
           blockId: config.rulesBlockId,
           draft: args.ruleDraft,
           maxBytes: config.maxBytes,
           pointerFor,
           reserveBytes: config.recycleReserveBytes,
+          ...(pinned !== undefined ? { pinned } : {}),
         })
         if (write.outcome.ok && write.outcome.action !== 'exists') {
           // 顺序是刻意的：**先归档、后写段**——归档失败时段还没动，状态一致（§5.6）
@@ -508,11 +525,22 @@ export function apply(ctx: Context, config: Config): void {
         const rules = store.contentOf(l, 'agent-rules')
         const candidate = args.task ?? store.contentOf(l, 'candidate-prompt')
         const parent = resolveParentAgent()
-        const started = await ctx.subagents.startContinuable({
+        // 0.2.1-alpha.2（升级指南 subagent-activations §3）：startContinuable 已被移除，
+        // 改为 startActivation，且 delivery 成为必填字段。
+        //   delivery: 'caller' = 只把结果交回调用方，不发父级完成通知。
+        // 本工具的 spawn 是「发出去就不管」的语义——结果由后续 submit 扫描子会话判定，
+        // 所以不能选 'parent'（那会凭空多出一条完成通知）。
+        const started = await ctx.subagents.startActivation({
           provider: 'spawn',
           label: 'rewrite-run-' + String(gen),
           request: { prompt: [{ type: 'text', text: buildTaskPrompt(candidate, rules) }], parent, agentOptions: undefined },
           signal: exec.signal,
+          delivery: 'caller',
+        })
+        // 本工具不消费 activation.result（判定走 submit 的会话扫描），但必须挂住它的
+        // rejection：否则子级失败会变成 unhandledRejection 直接打爆宿主进程。
+        void started.result.catch((err: unknown) => {
+          ctx.logger('dsh-agent-self-rewrite').warn('rewrite-run ' + runId + ' 子级执行失败：' + String(err))
         })
         recordRun(store, {
           runId,
@@ -520,7 +548,7 @@ export function apply(ctx: Context, config: Config): void {
           sessionId: started.childId,
           ...((parent as { id?: string }).id !== undefined ? { parentSessionId: (parent as { id?: string }).id as string } : {}),
         })
-        return { text: '子智能体已派发：run ' + runId + '（session ' + started.childId + '）\n注意：startContinuable 只投递初始 prompt 不唤醒——须由主会话显式发消息唤醒。' }
+        return { text: '子智能体已派发：run ' + runId + '（session ' + started.childId + '）\n注意：caller 投递只投递初始 prompt、不发完成通知也不唤醒——须由主会话显式发消息唤醒。' }
       }
       if (action === 'submit') {
         if (args.runId === undefined) return { text: 'submit 需要 runId' }

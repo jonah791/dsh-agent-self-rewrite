@@ -109,7 +109,124 @@ export function statusBreakdown(runs: readonly RunRecord[]): string {
   return [...known, ...unknown].map((s) => `${s} ${tally.get(s)}`).join(' · ')
 }
 
-export function buildStatus(input: StatusInput): StatusReport {
+/**
+ * 停滞读数：自指引擎「还在动吗」。
+ *
+ * 存在理由（2026-10-15 实测）：假设库 `active 0 / finding 0`、最新一条 confirmed 停在 25 天前，
+ * 而**没有任何面报出这件事**——`rewrite_status` 只报静态计数，不报「多久没动」。
+ * 论文 SpecForge（arXiv:2610.15708v1）的教训是「改进必须**累积**而非震荡」，
+ * 而本引擎当时的病**不是震荡是停滞**：五环的采证环整条停了，且不可见。
+ *
+ * ⚠ 空要分型（§5.9）：库空 / 从未布线 / 有布线三种情形**必须长得不一样**，
+ * 且天数一律为 `null` 而不是 0（0 天 = 今天刚动过，与「算不出来」是两回事）。
+ */
+export interface Staleness {
+  /** 最新一条 `confirmed` 假设的 `updatedAt`（近似「最后布线时刻」）；无 confirmed ⇒ `null` */
+  readonly lastWiredAt: string | null
+  /** 全部证据里最新的 `ts`（最后采证时刻）；无证据 ⇒ `null` */
+  readonly lastEvidenceAt: string | null
+  /** 距今天数（向下取整）；无对应时刻 ⇒ `null`（**不是 0**） */
+  readonly daysSinceWired: number | null
+  readonly daysSinceEvidence: number | null
+  /** 在采证的假设数（`active`）——**0 条 = 采证链断**，这是停滞的根因，比天数更该看 */
+  readonly collecting: number
+}
+
+const DAY_MS = 86_400_000
+
+/** ISO 时刻 → 距 `now` 的整天数（向下取整）；解析不出 ⇒ `null` */
+function daysSince(iso: unknown, now: Date): number | null {
+  if (typeof iso !== 'string' || iso.length === 0) return null
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return null
+  return Math.floor((now.getTime() - t) / DAY_MS)
+}
+
+export function stalenessOf(hypotheses: readonly Hypothesis[], now: Date): Staleness {
+  let lastWired: string | null = null
+  let lastEvidence: string | null = null
+  let collecting = 0
+  for (const h of hypotheses) {
+    if (h.status === 'active') collecting += 1
+    if (h.status === 'confirmed' && typeof h.updatedAt === 'string' && h.updatedAt.length > 0) {
+      if (lastWired === null || Date.parse(h.updatedAt) > Date.parse(lastWired)) lastWired = h.updatedAt
+    }
+    for (const ev of h.evidence ?? []) {
+      const ts = (ev as { ts?: unknown }).ts
+      if (typeof ts === 'string' && ts.length > 0 && !Number.isNaN(Date.parse(ts))) {
+        if (lastEvidence === null || Date.parse(ts) > Date.parse(lastEvidence)) lastEvidence = ts
+      }
+    }
+  }
+  return {
+    lastWiredAt: lastWired,
+    lastEvidenceAt: lastEvidence,
+    daysSinceWired: daysSince(lastWired, now),
+    daysSinceEvidence: daysSince(lastEvidence, now),
+    collecting,
+  }
+}
+
+/** 推进队列的一行：一条在采证的假设及其**归一化剩余缺口** */
+export interface AdvanceRow {
+  readonly id: string
+  readonly statement: string
+  readonly evidence: number
+  readonly threshold: number
+  /** `max(0, 阈值 − 证据) / max(阈值, 1)`；0 = 已达阈值（却仍是 active ⇒ 该看为什么没转 finding） */
+  readonly gapRatio: number
+}
+
+/**
+ * 推进队列：在采证的假设按**归一化剩余缺口升序** —— 最接近阈值的排最前。
+ *
+ * 判据来源：论文 SpecForge §3.2 的 discounted-UCB 奖励 `r̂ = Δφ / (1 − φ)`——
+ * 它**除以剩余缺口**，把「本质可修性」与「缺口大所以随便动动就涨」的平凡效应分开。
+ * 本函数只取其排序含义：**奖励接近完成的，而不是绝对进展最大的**。
+ *
+ * ⚠ 三条刻意的边界：
+ * - **不设阈值、不替主体选**——只排序 + 如实给缺口比，推进哪条由主体裁（§2.1 判断不可代填）；
+ * - 分母用 `max(阈值, 1)` 防除零，且比率型阈值（< 1）不会被算成负缺口；
+ * - 同缺口比时**证据多者在前**（更接近可裁决）。
+ */
+export function advanceQueue(hypotheses: readonly Hypothesis[]): readonly AdvanceRow[] {
+  return hypotheses
+    .filter((h) => h.status === 'active')
+    .map((h) => {
+      const threshold = typeof h.threshold === 'number' && Number.isFinite(h.threshold) ? h.threshold : 0
+      const evidence = (h.evidence ?? []).length
+      return {
+        id: h.id,
+        statement: h.statement,
+        evidence,
+        threshold,
+        gapRatio: Math.max(0, threshold - evidence) / Math.max(threshold, 1),
+      }
+    })
+    .sort((a, b) => (a.gapRatio === b.gapRatio ? b.evidence - a.evidence : a.gapRatio - b.gapRatio))
+}
+
+/** 推进面的渲染（纯文本层；不可用时不渲染——那是 `notes` 的职责，不许两处都说同一件事） */
+function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
+  if (stale.lastWiredAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0) {
+    return '推进面：无假设——五环的「猜想」环当前无内容'
+  }
+  const wired = stale.lastWiredAt === null
+    ? '从未布线'
+    : `最后布线 ${String(stale.daysSinceWired ?? '?')} 天前（${stale.lastWiredAt.slice(0, 10)}）`
+  const evidence = stale.lastEvidenceAt === null
+    ? '从未采证'
+    : `最后采证 ${String(stale.daysSinceEvidence ?? '?')} 天前`
+  const collecting = stale.collecting === 0
+    ? '在采证 0 条（**采证链停**：没有 active 假设，探针不会积累证据）'
+    : `在采证 ${String(stale.collecting)} 条`
+  const head = `推进面：${wired} · ${evidence} · ${collecting}`
+  if (queue.length === 0) return head
+  const top = queue.slice(0, 3).map((r) => `${r.id} ${String(r.evidence)}/${String(r.threshold)}`)
+  return head + `\n  最接近阈值（归一化缺口升序）：${top.join(' · ')}`
+}
+
+export function buildStatus(input: StatusInput, now: Date = new Date()): StatusReport {
   const notes: string[] = []
 
   const hypotheses = input.selfTest.ok ? input.selfTest.value.hypotheses : []
@@ -149,6 +266,11 @@ export function buildStatus(input: StatusInput): StatusReport {
     `锚点：${anchorText}`,
     `runs 记录：${input.runs.length}（${statusBreakdown(input.runs)}）· 未收尾 ${unclosed}`,
   )
+  if (input.selfTest.ok) {
+    // ⚠ 守卫是刻意的：库**读不到**时 `hypotheses` 也是空数组，直接渲染会把「读不到」印成
+    // 「无假设」（两种情形必须长得不一样——本模块头部那条纪律）。不可用时交给 notes 说。
+    lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses)))
+  }
   if (notes.length > 0) lines.push('', '注：', ...notes.map((n) => `- ${n}`))
 
   return { counts, notes, text: lines.join('\n') }

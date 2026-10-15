@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-self-rewrite",
-  "version": "0.1.0",
-  "description": "自改写引擎：AGENTS.md 标记段的唯一写者——把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。替换 dsh-agent-self-test + dsh-agent-evolve（设计见 docs/plans/插件融合设计_自改写与蒸馏_2026-09-23.md）。",
+  "version": "0.3.0",
+  "description": "自改写引擎：AGENTS.md 标记段的唯一写者——把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。0.2.0 起回收带**保护（pinned）**：受保护的高频纪律永不被 FIFO 迁出（纯 FIFO 会静默迁走核心规则 ⇒ 行为退化，而报告里那句还是成功）。0.3.0 起带**停滞面**：报出「最后布线/最后采证 N 天前」与在采证条数（`active 0` = **采证链停**，停滞的根因），并把在采证的假设按**归一化剩余缺口**排序（取论文 SpecForge §3.2 `r̂ = Δφ/(1−φ)` 的排序含义：奖励接近完成的）。替换 dsh-agent-self-test + dsh-agent-evolve（设计见 docs/plans/插件融合设计_自改写与蒸馏_2026-09-23.md）。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -21,13 +21,14 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/schemastery": "^3.18.1-rc.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
   },
   "scripts": {
+    "prepare": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"tests/*.test.mjs\""

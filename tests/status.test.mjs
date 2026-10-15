@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { buildStatus, collectStatus, countAnchors, countHypotheses } from '../lib/status.js'
+import { advanceQueue, buildStatus, collectStatus, countAnchors, countHypotheses, stalenessOf } from '../lib/status.js'
 import { resolveLegacyPaths } from '../lib/store.js'
 
 const ok = (value) => ({ ok: true, value })
@@ -148,4 +148,88 @@ test('端到端：夹具目录里真写 run 文件 ⇒ collectStatus 读数与�
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// ── 2026-10-15 加：停滞面 + 归一化推进队列（论文 SpecForge arXiv:2610.15708v1 迁移） ──
+// 实测缺口：假设库 active 0 / finding 0、最新 confirmed 停在 25 天前，而**没有任何面报出这件事**。
+// 论文的教训是「改进必须累积而非震荡」；本引擎当时的病是**停滞且不可见**。
+// 推进排序取论文 §3.2 `r̂ = Δφ/(1−φ)` 的**归一化缺口**含义：奖励接近完成的，而非绝对进展大的。
+
+const fixedNow = new Date('2026-10-15T12:00:00.000Z')
+// ⚠ `h()` 工厂**不含 `updatedAt`**（它是全量状态测试用的最小形状）——而 `stalenessOf` 正是读它，
+// 所以这里必须补上：漏了它，`lastWiredAt` 会**正确地**返回 null（2026-10-15 实测：两条红都源于此，
+// 是**夹具不完整**而不是实现缺陷）。
+const withEv = (status, evCount, thr, ts, updatedAt) => ({
+  ...h(status),
+  threshold: thr,
+  updatedAt: updatedAt ?? ts,
+  evidence: Array.from({ length: evCount }, (_, i) => ({ ts, kind: 'k', detail: 'd' + String(i) })),
+})
+
+test('stalenessOf：库空 ⇒ 天数全为 null（**不是 0**——「今天动过」与「算不出来」是两件事）', () => {
+  const s = stalenessOf([], fixedNow)
+  assert.equal(s.lastWiredAt, null)
+  assert.equal(s.daysSinceWired, null)
+  assert.equal(s.daysSinceEvidence, null)
+  assert.equal(s.collecting, 0)
+})
+
+test('stalenessOf：天数按 now 现算；在采证数**只数 active**（终态假设不算在采证）', () => {
+  const hs = [
+    withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z'),
+    withEv('active', 1, 5, '2026-09-25T00:00:00.000Z'),
+    withEv('refuted', 5, 5, '2026-08-01T00:00:00.000Z'),
+  ]
+  const s = stalenessOf(hs, fixedNow)
+  assert.equal(s.lastWiredAt, '2026-09-20T16:10:00.000Z')
+  assert.equal(s.daysSinceWired, 24, '09-20T16:10Z → 10-15T12:00Z = 24 天 19h50m ⇒ 向下取整 24')
+  assert.equal(s.lastEvidenceAt, '2026-09-25T00:00:00.000Z')
+  assert.equal(s.daysSinceEvidence, 20)
+  assert.equal(s.collecting, 1)
+})
+
+test('advanceQueue：按**归一化剩余缺口**升序——接近完成的排前，而不是证据多的排前', () => {
+  const hs = [
+    withEv('active', 1, 10, '2026-10-01T00:00:00.000Z'), // 缺口 9/10 = 0.90
+    withEv('active', 4, 5, '2026-10-01T00:00:00.000Z'), // 缺口 1/5  = 0.20 ← 最该推进
+    withEv('active', 5, 20, '2026-10-01T00:00:00.000Z'), // 缺口 15/20 = 0.75
+  ]
+  const q = advanceQueue(hs)
+  assert.deepEqual(q.map((r) => r.evidence), [4, 5, 1], '顺序 = 缺口比升序（按证据数降序会给出 [5,4,1]）')
+  assert.equal(q[0].gapRatio, 0.2)
+})
+
+test('advanceQueue：比率型阈值（< 1）不得算出负缺口；分母有防除零', () => {
+  const q = advanceQueue([withEv('active', 1, 0.25, '2026-10-01T00:00:00.000Z'), withEv('active', 0, 0, '2026-10-01T00:00:00.000Z')])
+  assert.ok(q.every((r) => r.gapRatio >= 0), '缺口比恒非负')
+  assert.ok(q.every((r) => Number.isFinite(r.gapRatio)), '零阈值不得产生 NaN/Infinity')
+})
+
+test('尸体：假设库**读不到** ⇒ 推进面整块缺席（「读不到」不许印成「无假设」）', () => {
+  const r = buildStatus({ selfTest: fail('missing', '文件不存在：Z'), ledger: ok({ resources: {} }), runs: [] }, fixedNow)
+  assert.ok(!r.text.includes('推进面：'), '不可用时推进面必须缺席——否则两种情形同貌')
+  assert.ok(r.notes.some((n) => n.includes('假设库不可用')))
+})
+
+test('推进面三态不许同貌：库空 / 有布线 / 采证链停 各说各的', () => {
+  const empty = buildStatus({ selfTest: ok({ hypotheses: [] }), ledger: ok({ resources: {} }), runs: [] }, fixedNow)
+  assert.ok(empty.text.includes('推进面：无假设'))
+
+  const stopped = buildStatus({
+    selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z')] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+  }, fixedNow)
+  assert.ok(stopped.text.includes('最后布线 24 天前'), '天数必须出现在推进面')
+  assert.ok(stopped.text.includes('在采证 0 条'), '0 条必须与「读不到」分开')
+  assert.ok(stopped.text.includes('采证链停'), '停滞的**根因**是采证链停，不是天数')
+
+  const live = buildStatus({
+    selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z'), withEv('active', 4, 5, '2026-10-01T00:00:00.000Z')] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+  }, fixedNow)
+  assert.ok(live.text.includes('在采证 1 条'))
+  assert.ok(live.text.includes('最接近阈值'), '有 active 时必须给出推进队列')
+  assert.ok(!live.text.includes('采证链停'), '有 active 时不得报链停')
 })

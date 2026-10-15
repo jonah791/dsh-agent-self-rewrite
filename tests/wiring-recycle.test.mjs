@@ -255,3 +255,125 @@ test('尽力而为：达不到目标余量 ⇒ 报 `tight` 并**回到最少迁�
   assert.equal(r.recycled.length, 1, '截断回最少迁移量')
   assert.ok(r.outcome.headroom >= 0 && r.outcome.headroom < 500)
 })
+
+// ---------- 保护（pinned）· 2026-10-14 加 ----------
+//
+// 存在理由（实测）：纯 FIFO 回收会把「报时前必读时钟」「交付进正文」这类**高频核心纪律**
+// 一并迁走 ⇒ 不再进每轮注入 ⇒ **静默行为退化**，而报告里那句还是 `stopped:'fits'`（成功）。
+// 重要性**不可由程序推断**（那是判断代填）⇒ 只执行主体显式声明的保护。
+
+/** 共用夹具：draft 大到必须回收才放得下，且只够迁 1–2 条 */
+function tightFixture() {
+  const e = [rule(1), rule(2), rule(3), rule(4)]
+  const full = fixture(e)
+  const draft = rule(5, 286)
+  const baseline = byteLength(
+    applyRuleUpsert(full, { blockId: 'self-test', draft, maxBytes: Number.MAX_SAFE_INTEGER }).content,
+  )
+  const maxBytes = baseline + byteLength(pointerFor(1)) - byteLength(e[0]) + 1
+  return { e, full, draft, maxBytes }
+}
+
+test('保护生效：受保护条目永不被迁出，且原位保留（回收照旧继续）', () => {
+  const { full, draft, maxBytes } = tightFixture()
+  const isPinned = (entry) => entry.includes('规则1')
+
+  const r = applyRuleUpsertWithRecycle(full, {
+    blockId: 'self-test',
+    draft,
+    maxBytes,
+    pointerFor,
+    reserveBytes: 0,
+    pinned: isPinned,
+  })
+
+  assert.equal(r.outcome.ok, true)
+  assert.ok(!r.recycled.some((x) => x.includes('规则1')), '受保护条目不得进迁出集合')
+  assert.ok(r.recycled.length >= 1, '保护 ≠ 停止回收：未受保护的照迁')
+  const inner = extractBlockInner(r.outcome.content, SELF_TEST)
+  assert.ok(inner.includes('规则1'), '受保护条目留在段内')
+  assert.equal(r.pinnedRemaining, 1, '可见面：段内受保护条数报出来')
+})
+
+test('负对照：不配 pinned ⇒ 与旧行为逐字节一致（保护是纯增量）', () => {
+  const { full, draft, maxBytes } = tightFixture()
+
+  const a = applyRuleUpsertWithRecycle(full, { blockId: 'self-test', draft, maxBytes, pointerFor, reserveBytes: 0 })
+  const b = applyRuleUpsertWithRecycle(full, {
+    blockId: 'self-test',
+    draft,
+    maxBytes,
+    pointerFor,
+    reserveBytes: 0,
+    pinned: undefined,
+  })
+  assert.equal(a.outcome.content, b.outcome.content, '逐字节一致')
+  assert.deepEqual(a.recycled, b.recycled)
+  assert.equal(a.stopped, b.stopped)
+  assert.equal(b.pinnedRemaining, 0, '没配保护 ⇒ 计数 0（与「配了但没命中」分得开）')
+
+  // 关键：pin 必须**真的改变**迁出集合——否则这条负对照没有区分力（恒同 = 装饰品）
+  const c = applyRuleUpsertWithRecycle(full, {
+    blockId: 'self-test',
+    draft,
+    maxBytes,
+    pointerFor,
+    reserveBytes: 0,
+    pinned: (x) => x.includes('规则1'),
+  })
+  assert.notDeepEqual(c.recycled, a.recycled, 'pin 改变迁出集合（有区分力）')
+})
+
+test('全被保护且仍放不下 ⇒ 如实 `exhausted` + 拒写 + 一字未迁（不静默放行）', () => {
+  const e = [rule(1), rule(2), rule(3)]
+  const full = fixture(e)
+  const draft = rule(4, 900)
+  const baseline = byteLength(
+    applyRuleUpsert(full, { blockId: 'self-test', draft, maxBytes: Number.MAX_SAFE_INTEGER }).content,
+  )
+  const maxBytes = baseline - 10
+
+  const r = applyRuleUpsertWithRecycle(full, {
+    blockId: 'self-test',
+    draft,
+    maxBytes,
+    pointerFor,
+    pinned: () => true,
+  })
+
+  assert.equal(r.outcome.ok, false, '放不下就拒写')
+  assert.equal(r.recycled.length, 0, '拒写 ⇒ 迁出恒为空（调用方不可能误把没收到的迁移写进归档）')
+})
+
+test('两实现的**保护语义**一致：同一 pinned 下两边都不迁受保护条目', () => {
+  // ⚠ 立判据时的坑（实测踩过，第一版红）：不能断言「两实现的迁出集合相同」——它们的
+  // **预算口径本就不同**（端到端那条含指针行，`recycleOldest` 的 fits 只吃候选段内文本）
+  // ⇒ 迁移条数可以不同。真正必须一致的是**保护语义**：受保护条目在两条路径上都不被迁出。
+  const e = [rule(1), rule(2), rule(3), rule(4)]
+  const full = fixture(e)
+  const inner = joinEntries(e)
+  const isPinned = (x) => x.includes('规则1')
+
+  // ① 纯函数侧：用一个纯计数谓词（不涉字节）⇒ 必然迁到剩 2 条，与 pin 无因果纠缠
+  const viaOldest = recycleOldest(inner, (cand) => splitEntries(cand).length <= 2, 1, isPinned)
+  assert.ok(viaOldest.recycled.length >= 2, '夹具自检：确实迁了（否则「没违规」是假绿）')
+  assert.ok(!viaOldest.recycled.some(isPinned), '受保护条目不迁（纯函数侧）')
+  assert.equal(viaOldest.pinnedRemaining, 1)
+
+  // ② 端到端侧：同一 pinned，用字节预算逼它迁
+  const draft = rule(5, 286)
+  const baseline = byteLength(
+    applyRuleUpsert(full, { blockId: 'self-test', draft, maxBytes: Number.MAX_SAFE_INTEGER }).content,
+  )
+  const maxBytes = baseline + byteLength(pointerFor(1)) - byteLength(e[0]) + 1
+  const viaWrite = applyRuleUpsertWithRecycle(full, {
+    blockId: 'self-test',
+    draft,
+    maxBytes,
+    pointerFor,
+    reserveBytes: 0,
+    pinned: isPinned,
+  })
+  assert.ok(viaWrite.recycled.length >= 1, '夹具自检：端到端侧确实迁了')
+  assert.ok(!viaWrite.recycled.some(isPinned), '受保护条目不迁（端到端侧）')
+})
