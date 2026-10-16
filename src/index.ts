@@ -34,6 +34,8 @@ import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
 import { buildStatus, selfRewriteSnapshot, type ArtifactStat, type SelfRewriteSnapshot } from './status.js'
 import { applyBlockSet, applyRuleUpsertWithRecycle, byteLength, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
+import { runGate } from './gate-io.js'
+import { gateTraceLine } from './gate.js'
 import {
   addHypothesis,
   applyVerdict,
@@ -107,6 +109,11 @@ export interface Config {
    * 重要性**不可由程序推断**（那是判断代填）⇒ 只能由主体显式声明。留空 = 不保护（行为与旧版一致）。
    */
   pinnedPatterns: string[]
+  /**
+   * 外生接受位（2026-10-17）：`confirm` 写盘前先过闸（冻结账 + 注入器 + 良性对照）。
+   * 缺省**开**。置 `false` 只在**闸门本身出问题**时用，且须在同一次改动里写明理由。
+   */
+  acceptanceGate: boolean
   /** 覆盖旧件 `dsh-agent-self-test` 的 dataDir（留空 ⇒ `<DSH_HOME>/agent-self-test`） */
   selfTestDataDir: string
   /** 覆盖旧件 `dsh-agent-evolve` 的 dataDir（留空 ⇒ `<DSH_HOME>/.evolve`） */
@@ -129,6 +136,16 @@ export const Config = z.object({
   rulesFile: z.string().default('AGENTS.md'),
   maxBytes: z.number().default(64800),
   rulesBlockId: z.string().default('self-test'),
+  /**
+   * 外生接受位（2026-10-17 · 设计 `docs/design/exogenous-acceptance-gate.md`）。
+   *
+   * `confirm` 写盘前先过闸：冻结账（写规则**之前**落盘且只读）+ 注入器（对注入样本红）
+   * + 良性对照（同位置同表面角色，必须绿）。缺省**开**——它是我唯一能装在自己控制之外的接受位。
+   *
+   * 置 `false` 只在**闸门本身出问题**时用，且必须在同一次改动里写明理由
+   * （关掉它 = 回到纯内生接受环 ⇒ 论文的信息论下界 α+β ≥ 1−TV 重新适用）。
+   */
+  acceptanceGate: z.boolean().default(true),
   archivePath: z.string().default(''),
   recycleReserveBytes: z.number().default(1024),
   pinnedPatterns: z.array(z.string()).default([]),
@@ -635,6 +652,31 @@ export function apply(ctx: Context, config: Config): void {
 
       let wired = ''
       if (outcome.needsWiring && args.ruleDraft !== undefined) {
+        // ★ 外生接受位（2026-10-17）：写盘前先过闸。
+        // 写判据的是我、被审的也是我 ⇒ arXiv:2607.24300 的信息论下界直接适用
+        // （α+β ≥ 1−TV(P₊,P₋)：纯内生门不可能把两个错误都做小，这是结构问题不是纪律问题）。
+        // 闸门中「在我控制之外」的部分 = 冻结账在写规则**之前**落盘且只读 ⇒ 不能为这次改动定制。
+        if (config.acceptanceGate) {
+          const decision = runGate(dshHome, args.id, args.ruleDraft)
+          try {
+            appendFileSync(
+              join(dshHome, 'acceptance-gate-trace.jsonl'),
+              gateTraceLine(args.id, decision, new Date().toISOString()) + '\n',
+              'utf8',
+            )
+          } catch {
+            // 轨迹落盘失败不阻断（观测绝不反噬主流程 · §5.22）
+          }
+          if (!decision.accepted) {
+            return {
+              text:
+                '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status
+                + '\n⛔ **外生接受位拒绝**（' + decision.stage + '）：' + decision.reason
+                + '\n规则**未写入** AGENTS.md（拒绝的是**布线**，不是裁决本身——假设状态已更新）。'
+                + '\n冻结账形态：`<DSH_HOME>/acceptance-sealed/<ruleId>.json`；设计见 `docs/design/exogenous-acceptance-gate.md`',
+            }
+          }
+        }
         const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
         const pointerFor = (n: number): string =>
           RECYCLE_POINTER_PREFIX + ' 已回收 ' + String(n) + ' 条至 ' + relArchive + '（' + new Date().toISOString().slice(0, 10) + '）'
