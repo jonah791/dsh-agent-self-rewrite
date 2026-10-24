@@ -62,6 +62,12 @@ export interface StatusCounts {
   readonly other: number
   /** 使能型声明的**待兑现**数（`pending`）——独立一档，**不并入 active**（并入会掩盖「采证链停」） */
   readonly pending: number
+  /**
+   * 「已裁决但无法归因」数（`confounded`，2026-10-21）——独立一档。
+   * **不并入 other**（混进去会让「我不知道」与「数据坏了」同貌）；
+   * **也不并入 findings**（它已经走了一次裁决，只是那次没能得出结论）。
+   */
+  readonly confounded: number
   /** 账本可读时的锚点数；不可读时为 `null`（**不是 0**） */
   readonly anchors: number | null
   /** runs 目录里的**记录数**——**不是**「未收尾轮次数」（后者是 `unclosed`） */
@@ -94,6 +100,7 @@ export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusC
   let refuted = 0
   let archived = 0
   let pending = 0
+  let confounded = 0
   let other = 0
   for (const h of hypotheses) {
     if (h.status === 'active') active += 1
@@ -102,9 +109,10 @@ export function countHypotheses(hypotheses: readonly Hypothesis[]): Omit<StatusC
     else if (h.status === 'refuted') refuted += 1
     else if (h.status === 'archived') archived += 1
     else if (h.status === 'pending') pending += 1
+    else if (h.status === 'confounded') confounded += 1
     else other += 1
   }
-  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, archived, pending, other }
+  return { hypotheses: hypotheses.length, active, findings, confirmed, refuted, archived, pending, confounded, other }
 }
 
 /** 账本可读 ⇒ 锚点总数；不可读 ⇒ `null`（区分「没有锚点」与「读不到账本」） */
@@ -313,7 +321,10 @@ export interface StarvationRow {
  *
  * ⚠ 三条刻意的边界：
  * - **不设饥饿阈值**（§2.4 判断不可代填）：报出**年龄**，饿不饿由主体看——新登记的假设零证据是正常的；
- * - **不分状态过滤**：`active` / `refuted` / `confirmed` 的零证据都算，因为它们指向三种不同的病；
+ * - **按状态区分「病」，但不代填判断**：`active` / `refuted` / `confirmed` 的零证据都算，
+ *   因为它们指向三种不同的病；而 `pending`（使能型，零证据是设计）与 `archived`（主动收口，
+ *   零证据是**收口的结果**）**排除**——把后两者算进来会让这一面失真
+ *   （2026-10-25 实测：报「零证据 9 条」，其中 7 条 archived、1 条 refuted，真正待查只有 1 条）；
  * - **按探针分档**（论文 size-niche 的对应物）：饥饿若集中在某一类探针上，那是**探针的系统性缺陷**
  *   而非某条假设的问题——混成一个总数就把这个信号抹平了。
  */
@@ -341,7 +352,10 @@ export function starvationOf(hypotheses: readonly Hypothesis[], now: Date): Star
   for (const h of hypotheses) {
     // ⚠ 使能型声明天然零证据（它不靠证据，靠依赖路径兑现）⇒ 计入会把信号面污染成「恒有饥饿」，
     // 而这一面存在的理由正是分辨「请求了 N 条、落点 0 条」的真饥饿。
-    if (h.status === 'pending') continue
+    // ⚠ `archived` 同理（2026-10-25 补）：它的零证据是**主动收口的结果**，不是饥饿。
+    // 漏排会让「已收敛的假设」与「真采不到的假设」同貌——当日实测报「零证据 9 条」，
+    // 逐条查下来 7 条是 archived、1 条已 refuted，**真正待查的只有 1 条 active**。
+    if (h.status === 'pending' || h.status === 'archived') continue
     const kind = typeof h.probe?.kind === 'string' && h.probe.kind.length > 0 ? h.probe.kind : '(未标探针)'
     const slot = perProbe.get(kind) ?? { total: 0, zero: 0, oldest: null }
     slot.total += 1
@@ -555,7 +569,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
     }
   }
   lines.push(
-    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / archived ${base.archived} / pending ${base.pending}${base.other ? ` / other ${base.other}` : ''}）`,
+    `假设：${base.hypotheses} 条（active ${base.active} / finding ${base.findings} / confirmed ${base.confirmed} / refuted ${base.refuted} / archived ${base.archived} / pending ${base.pending} / confounded ${base.confounded}${base.other ? ` / other ${base.other}` : ''}）`,
     `锚点：${anchorText}`,
     `runs 记录：${input.runs.length}（${statusBreakdown(input.runs)}）· 未收尾 ${unclosed}`,
   )

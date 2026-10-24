@@ -146,7 +146,18 @@ export function addHypothesis(state: SelfTestState, input: AddHypothesisInput, n
   return { hypothesis, clusterNote }
 }
 
-export type Verdict = 'confirm' | 'refute' | 'refine'
+/**
+ * 裁决动作。
+ *
+ * `confounded` 是 2026-10-21 增补的第四态（论文依据：Harness² 的 Experience Reflector,
+ * arXiv:2610.14224 §H Prompt 6）：它表示「证据既不足以确认、也不足以证伪，或一条改动同时
+ * 动了多个部件而没有执行能隔离其中之一」。原文判据：**「confounded 行是有用的记录；
+ * 编造的归因会毒害整个库。」** 缺这一态时，证据不足会被迫伪装成 confirm 或 refute ——
+ * 那正是「把不知道写成知道」。
+ *
+ * 状态落点是 `confounded`（**非终态**）：后续证据够了仍可 confirm/refute/refine。
+ */
+export type Verdict = 'confirm' | 'refute' | 'refine' | 'confounded'
 
 export interface VerdictInput {
   readonly id: string
@@ -180,12 +191,14 @@ export interface VerdictOutcome {
 export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Date = new Date()): VerdictOutcome {
   const h = state.hypotheses.find((x) => x.id === input.id)
   if (h === undefined) throw new Error(`假设不存在：${input.id}`)
-  if (h.status !== 'finding' && input.verdict === 'confirm') {
+  // confounded 不是终态：后续证据够了仍可 confirm（它只表示「这一轮无法归因」）
+  if (h.status !== 'finding' && h.status !== 'confounded' && input.verdict === 'confirm') {
     throw new Error(`只有 finding 可以 confirm（当前状态：${h.status}）`)
   }
   const direction = computeDirection(h.evidence, h.probe)
   let polarityWarning: string | null = null
-  if (input.verdict !== 'refine' && contradictsDirection(input.verdict, direction.direction, direction.lean)) {
+  // confounded 不参与极性护栏：它本来就没有方向，谈不上「与证据方向相悖」
+  if (input.verdict !== 'refine' && input.verdict !== 'confounded' && contradictsDirection(input.verdict, direction.direction, direction.lean)) {
     polarityWarning = `⚠ 护栏提示：${direction.text} —— 而你选择了 ${input.verdict}。`
       + (direction.direction === 'refute'
         ? '若主张本就该被证伪（「我不会 X」型），正确动作通常是 refute 或 refine（改写断言后重新采证）。'
@@ -217,6 +230,13 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
   } else if (input.verdict === 'refute') {
     h.status = 'refuted'
     h.resolution = note(input.resolution ?? 'refuted by evidence')
+  } else if (input.verdict === 'confounded') {
+    // 无法归因：证据既不支持成立、也不支持不成立，或一条改动同时动了多个部件而没有
+    // 执行能隔离其中之一。**独立态而非二选一**——否则「不知道」会被记成「知道」，
+    // 而库里的假归因会毒害之后每一次读取（Harness² Prompt 6 原文判据）。
+    // 证据保留不丢：后续补足隔离实验后可直接 confirm/refute/refine。
+    h.status = 'confounded'
+    h.resolution = note(input.resolution ?? 'confounded: 证据不足或无法隔离归因（保留待再采证）')
   } else {
     h.status = 'active'
     if (input.newStatement !== undefined) h.statement = input.newStatement

@@ -18,9 +18,15 @@ const fail = (reason, detail = 'x') => ({ ok: false, reason, detail })
 
 const h = (status) => ({ id: `h-${status}-${Math.random()}`, statement: 's', prediction: 'p', status, threshold: 3, probe: {}, evidence: [] })
 
-test('countHypotheses：六态分类，未知取值进 other（不猜不吞）', () => {
+test('countHypotheses：七态分类，未知取值进 other（不猜不吞）', () => {
   const c = countHypotheses([h('active'), h('active'), h('finding'), h('confirmed'), h('refuted'), h('weird')])
-  assert.deepEqual(c, { hypotheses: 6, active: 2, findings: 1, confirmed: 1, refuted: 1, archived: 0, pending: 0, other: 1 })
+  assert.deepEqual(c, { hypotheses: 6, active: 2, findings: 1, confirmed: 1, refuted: 1, archived: 0, pending: 0, confounded: 0, other: 1 })
+})
+
+test('countHypotheses：confounded 独立成档，不混进 other（2026-10-21 第四态）', () => {
+  const c = countHypotheses([h('confounded'), h('confounded'), h('weird')])
+  assert.equal(c.confounded, 2, 'confounded 必须独立成档——「无法归因」与「未知取值」是两件事')
+  assert.equal(c.other, 1, 'other 只装七态之外的取值——confounded 混进来这条会变成 3')
 })
 
 test('尸体：archived 是**正常状态**，不得混进 other（t-2a164936 的判据）', () => {
@@ -137,8 +143,8 @@ test('尸体：archived 假设不触发「未知取值」注（它是正常状�
 test('真实语料形状：32 条全终态 ⇒ active/finding 均为 0，计数与文本一致', () => {
   const hypotheses = [...Array(13).fill(0).map(() => h('confirmed')), ...Array(19).fill(0).map(() => h('refuted'))]
   const r = buildStatus({ selfTest: ok({ hypotheses }), ledger: fail('missing'), runs: [] })
-  assert.deepEqual(r.counts, { hypotheses: 32, active: 0, findings: 0, confirmed: 13, refuted: 19, archived: 0, pending: 0, other: 0, anchors: null, runs: 0, unclosed: 0 })
-  assert.ok(r.text.includes('假设：32 条（active 0 / finding 0 / confirmed 13 / refuted 19 / archived 0 / pending 0）'))
+  assert.deepEqual(r.counts, { hypotheses: 32, active: 0, findings: 0, confirmed: 13, refuted: 19, archived: 0, pending: 0, confounded: 0, other: 0, anchors: null, runs: 0, unclosed: 0 })
+  assert.ok(r.text.includes('假设：32 条（active 0 / finding 0 / confirmed 13 / refuted 19 / archived 0 / pending 0 / confounded 0）'))
   // 2026-10-03 修正：空目录与「跑了但都收尾了」必须长得不一样（不许都报「未收尾 0」）
   assert.ok(r.notes.some((n) => n.includes('runs 目录为空')))
 })
@@ -313,6 +319,24 @@ test('starvationOf：零证据与「已裁 refuted」分开报——后者是「
   assert.equal(s.refutedWithoutEvidence, 2, 'refuted 且零证据 = 2')
   assert.equal(s.confirmedWithoutEvidence, 0)
   assert.equal(s.oldestZeroAgeDays, 34, '09-11 → 10-15 = 34 天')
+})
+
+test('starvationOf：archived 的零证据不算饥饿——它是主动收口的结果，不是「采不到」', () => {
+  // 2026-10-25 实测驱动：报「零证据 9 条」时逐条查下来 7 条是 archived、1 条已 refuted，
+  // 真正待查只有 1 条 active。已收口的假设与真采不到的假设同貌，会让这一面把人引向
+  // 「探针失明了」的错误方向。
+  const hs = [
+    bare('archived', 'tool-failure-rate', 8, '2026-09-01T00:00:00.000Z'),
+    bare('archived', 'probe-before-action', 8, '2026-09-02T00:00:00.000Z'),
+    bare('archived', 'plan-before-action', 8, '2026-09-03T00:00:00.000Z'),
+    bare('active', 'claim-vs-evidence', 1, '2026-10-14T00:00:00.000Z'),
+  ]
+  const s = starvationOf(hs, fixedNow)
+  assert.equal(s.zeroEvidence, 1, '三条 archived 不得计入')
+  assert.equal(s.rows.length, 1)
+  assert.equal(s.rows[0].status, 'active', '清单里只该剩下 active 的')
+  assert.deepEqual(s.byProbe.map((p) => p.kind), ['claim-vs-evidence'], 'archived 的探针档不该占版面')
+  assert.equal(s.oldestZeroAgeDays, 1, '最老年龄也只该由 active 那条决定')
 })
 
 test('starvationOf：按探针分档（论文 niche 的对应物）——饥饿集中在哪类探针上必须看得见', () => {

@@ -46,7 +46,7 @@ export function runScript(scriptPath: string, home: string): number | null {
   if (!existsSync(target)) return null
   try {
     // ② 不经 shell（无注入面）· ③ 输出丢弃（单比特判据不看输出）
-    execFileSync(process.execPath, [target], { timeout: 30_000, stdio: 'ignore' })
+    execFileSync(process.execPath, [target], { windowsHide: true, timeout: 30_000, stdio: 'ignore' })
     return 0
   } catch (e) {
     const status = (e as { status?: unknown }).status

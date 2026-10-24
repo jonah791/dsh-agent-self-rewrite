@@ -76,8 +76,14 @@ export interface Evidence {
   detail: Record<string, unknown>
 }
 
-/** 假设状态机（`pending` = 使能型声明的待兑现态，见 `Hypothesis.enabling`） */
-export type HypothesisStatus = 'active' | 'finding' | 'confirmed' | 'refuted' | 'archived' | 'pending'
+/**
+ * 假设状态机（`pending` = 使能型声明的待兑现态，见 `Hypothesis.enabling`）。
+ *
+ * `confounded`（2026-10-21）= 「已尝试裁决但无法归因」：既不是 confirmed 也不是 refuted，
+ * **非终态**（后续证据够了仍可 confirm/refute/refine）。它不进入收敛判据的分母
+ * （`cluster.ts` 的 terminal 仍只算 confirmed+refuted）——「无法归因」不证明任何方向。
+ */
+export type HypothesisStatus = 'active' | 'finding' | 'confirmed' | 'refuted' | 'archived' | 'pending' | 'confounded'
 
 /**
  * 探针定义（**住数据里**）。

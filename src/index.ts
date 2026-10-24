@@ -625,11 +625,11 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ③ rewrite_verdict（唯一写 AGENTS.md 的入口） ----------
   ctx.tools.register(tool({
     name: 'rewrite_verdict',
-    description: '裁决 finding 并当场布线——**唯一写 AGENTS.md 标记段的入口**。verdict=confirm（需 finding）会按 ruleDraft 累积写入并生成记录；refute 淘汰；refine 细化后重新采证。'
+    description: '裁决 finding 并当场布线——**唯一写 AGENTS.md 标记段的入口**。verdict=confirm（需 finding）会按 ruleDraft 累积写入并生成记录；refute 淘汰；refine 细化后重新采证；**confounded = 证据不足或无法隔离归因**（独立态，不逼你在 confirm/refute 之间二选一；非终态，补足证据后可再裁）。'
       + '裁决前用 polarity.ts 算证据方向，动作与方向相悖时返回护栏提示（**只提示不阻断**，决策权归主体）。超预算一律拒写，绝不截断。',
     parameters: {
       id: { type: 'string', required: true, description: '假设 id' },
-      verdict: { type: 'string', required: true, description: 'confirm | refute | refine' },
+      verdict: { type: 'string', required: true, description: 'confirm | refute | refine | confounded（confounded = 无法归因，需在 resolution 说明为何证据不足或哪几处改动纠缠在一起）' },
       ruleDraft: { type: 'string', description: 'confirm 时：要写入 AGENTS.md 的规则文本' },
       newStatement: { type: 'string', description: 'refine：新陈述' },
       newThreshold: { type: 'number', description: 'refine：新阈值' },
