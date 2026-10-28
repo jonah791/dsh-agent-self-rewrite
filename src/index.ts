@@ -48,6 +48,7 @@ import {
   type Verdict,
 } from './hypotheses.js'
 import { createProbeEngine, readLifeLogLines } from './probes.js'
+import { domainHints, domainLine } from './probe-domain.js'
 import {
   RULES_FILE,
   SINK_RESOURCE_IDS,
@@ -522,6 +523,7 @@ export function apply(ctx: Context, config: Config): void {
             + ' [' + h.id + '] ' + h.statement
             + '\n   探针 ' + h.probe.kind + '（极性 ' + String(h.probe.polarity ?? '默认') + '）| 证据 ' + String(h.evidence.length) + '/' + String(h.threshold)
             + ' | 方向 ' + h.direction.direction + '（支持 ' + String(h.direction.support) + '/反对 ' + String(h.direction.refute) + '）| ' + h.status
+            + '\n   ' + domainLine(h.probe.kind)
             + (h.stability.unstable
               ? '\n   ⚠ ' + h.stability.text + (h.stability.notes.length > 0 ? '｜' + h.stability.notes.join('｜') : '')
               : '')).join('\n'),
@@ -613,11 +615,14 @@ export function apply(ctx: Context, config: Config): void {
       })
       saveHypotheses(paths, state)
       const clusterSuffix = added.clusterNote.length > 0 ? '\n' + added.clusterNote : ''
+      // 探针域提示（2026-10-28）：**只提示不拦截** —— 语义判断不可靠，拒绝会让人转向绕过。
+      const hints = enabling ? [] : domainHints(added.hypothesis.probe.kind, args.statement ?? '')
+      const hintSuffix = hints.length > 0 ? '\n' + hints.join('\n') : ''
       return {
         text: enabling
           ? '已登记使能型声明 [' + added.hypothesis.id + ']（pending，待兑现）｜依赖路径：' + (args.deps ?? []).join(' / ')
             + '\n⚠ 它**不进 active**（探针不采它，也不计入采证链读数）：兑现时 rewrite_hypothesis(action=fulfill, id=...)；未兑现的会出现在 rewrite_status 的承诺面。' + clusterSuffix
-          : '已登记 [' + added.hypothesis.id + ']（active，阈值 ' + String(added.hypothesis.threshold) + '）——插件开始被动采证。' + clusterSuffix,
+          : '已登记 [' + added.hypothesis.id + ']（active，阈值 ' + String(added.hypothesis.threshold) + '）——插件开始被动采证。' + clusterSuffix + hintSuffix,
       }
     },
   }))
