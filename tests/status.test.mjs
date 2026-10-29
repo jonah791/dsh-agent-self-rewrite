@@ -294,6 +294,22 @@ test('推进面三态不许同貌：库空 / 有布线 / 采证链停 各说各�
   assert.ok(!live.text.includes('采证链停'), '有 active 时不得报链停')
 })
 
+// ── 2026-10-29 加：布线读数必须自报口径（台账 lh-2b453836） ──────────
+// 存在理由：`lastWiredAt` 取的是「最新一条 confirmed 假设的 updatedAt」，**不是写 AGENTS.md 段的时刻**。
+// 2026-10-29 实测：两个自动段内 0 条规则（规则已迁去正文），而读数仍报「最后布线 38 天前」
+// ⇒ 读者会以为「最近真的布过线」。口径标注只让读数诚实，不把红改绿（confirm 仍 38 天前）。
+test('布线读数标注口径：不得让 confirm 时刻冒充写段时刻', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z')] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+  }, fixedNow)
+  assert.ok(
+    r.text.includes('按 confirm 时刻近似'),
+    '口径标注必须出现——否则「最后布线 24 天前」会被读成「最近一次写段」',
+  )
+})
+
 // ── 2026-10-15 加：信号饥饿面（论文 TESEARCH arXiv:2610.15964v1 迁移） ──────────
 // 论文 §4 landing kernel：LLM 是 noisy actuator——「请求生成 N 个」与「实际落 M 个」有系统性偏差，
 // 论文建模它并在请求时补偿。本引擎的对应物：登记时设 `threshold = N`（请求 N 条证据），探针落

@@ -429,9 +429,13 @@ function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
   if (stale.lastWiredAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0) {
     return '推进面：无假设——五环的「猜想」环当前无内容'
   }
+  // ⚠ 口径（2026-10-29 补）：`lastWiredAt` 是「最新一条 confirmed 假设的 `updatedAt`」，
+  // **不是写 AGENTS.md 段的时刻**。不标出来会被读成「最近一次真的布了线」——而实测段内可能
+  // 一条规则都没有（规则已迁去正文，见台账 lh-2b453836）。标注只让读数**诚实**，
+  // 不改变它仍报「38 天前」这个事实（红=设计，不为消红改判据）。
   const wired = stale.lastWiredAt === null
     ? '从未布线'
-    : `最后布线 ${String(stale.daysSinceWired ?? '?')} 天前（${stale.lastWiredAt.slice(0, 10)}）`
+    : `最后布线 ${String(stale.daysSinceWired ?? '?')} 天前（${stale.lastWiredAt.slice(0, 10)}·按 confirm 时刻近似）`
   const evidence = stale.lastEvidenceAt === null
     ? '从未采证'
     : `最后采证 ${String(stale.daysSinceEvidence ?? '?')} 天前`
