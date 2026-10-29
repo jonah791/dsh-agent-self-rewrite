@@ -310,6 +310,25 @@ test('布线读数标注口径：不得让 confirm 时刻冒充写段时刻', ()
   )
 })
 
+// ── 2026-10-29 加：段内规则数四态（台账 lh-2b453836） ──────────────
+// 存在理由：只有「最后布线 N 天前」时，读者分不出「38 天前布过线」与
+// 「38 天前 confirm 过、段里其实一条规则都没有」。两个读数同框才答得出。
+// 四态互不掩盖是刻意的：未提供（不渲染）/ 读不到 / 0 条 / N 条——
+// 「0 条」是读数，「读不到」是失明，印成同一句就分不清了。
+test('段内规则数四态互不掩盖：未提供 / 读不到 / 0 条 / N 条', () => {
+  const mk = (rulesInBlock) => buildStatus({
+    selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z')] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+    ...(rulesInBlock === undefined ? {} : { rulesInBlock }),
+  }, fixedNow)
+
+  assert.ok(!mk(undefined).text.includes('段内'), '未提供 ⇒ 整段不渲染（老调用方输出形状不变）')
+  assert.ok(mk(null).text.includes('段内规则数**读不到**'), '读不到必须说出来，不能省略成「0 条」')
+  assert.ok(mk(0).text.includes('段内 **0** 条规则'), '0 条是读数不是缺席')
+  assert.ok(mk(7).text.includes('段内 **7** 条规则'), 'N 条要报出来')
+})
+
 // ── 2026-10-15 加：信号饥饿面（论文 TESEARCH arXiv:2610.15964v1 迁移） ──────────
 // 论文 §4 landing kernel：LLM 是 noisy actuator——「请求生成 N 个」与「实际落 M 个」有系统性偏差，
 // 论文建模它并在请求时补偿。本引擎的对应物：登记时设 `threshold = N`（请求 N 条证据），探针落

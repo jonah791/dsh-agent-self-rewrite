@@ -49,6 +49,15 @@ export interface StatusInput {
    * （本工具存在的理由就是「一条命令看全」，看不见的那条等于没被管）。
    */
   readonly artifacts?: readonly ArtifactStat[]
+  /**
+   * `rulesBlockId` 段内**当前规则条数**：`null` = 段读不到，`undefined` = 调用方没提供（不渲染）。
+   *
+   * 存在理由（2026-10-29）：`daysSinceWired` 测的是「最新一条 confirmed 假设的 `updatedAt`」，
+   * **不是写段时刻**。少了这个读数，读者无法区分「38 天前真的布过线」与「38 天前 confirm 过、
+   * 而段里其实一条规则都没有」——2026-10-29 实测的真相是后者（台账 `lh-2b453836`）。
+   * 三态互不掩盖：没提供（不渲染）/ 读不到（说「读不到」）/ 0 条（说「0 条」）。
+   */
+  readonly rulesInBlock?: number | null
 }
 
 export interface StatusCounts {
@@ -425,7 +434,7 @@ function signalLine(s: Starvation): string {
 }
 
 /** 推进面的渲染（纯文本层；不可用时不渲染——那是 `notes` 的职责，不许两处都说同一件事） */
-function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
+function advanceLine(stale: Staleness, queue: readonly AdvanceRow[], rulesInBlock?: number | null): string {
   if (stale.lastWiredAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0) {
     return '推进面：无假设——五环的「猜想」环当前无内容'
   }
@@ -442,7 +451,15 @@ function advanceLine(stale: Staleness, queue: readonly AdvanceRow[]): string {
   const collecting = stale.collecting === 0
     ? '在采证 0 条（**采证链停**：没有 active 假设，探针不会积累证据）'
     : `在采证 ${String(stale.collecting)} 条`
-  const head = `推进面：${wired} · ${evidence} · ${collecting}`
+  // 段内规则数（2026-10-29）：三态**互不掩盖**——未提供不渲染（老调用方形状不变）/
+  // 读不到（说读不到）/ 0 条 / N 条。没有它，「最后布线 38 天前」会被读成「段里有一堆
+  // 38 天前写的规则」，而实测段内 0 条（台账 lh-2b453836）。
+  const rules = rulesInBlock === undefined
+    ? null
+    : rulesInBlock === null
+      ? '段内规则数**读不到**'
+      : `段内 **${String(rulesInBlock)}** 条规则`
+  const head = `推进面：${wired}${rules === null ? '' : ' · ' + rules} · ${evidence} · ${collecting}`
   if (queue.length === 0) return head
   const top = queue.slice(0, 3).map((r) => `${r.id} ${String(r.evidence)}/${String(r.threshold)}`)
   return head + `\n  最接近阈值（归一化缺口升序）：${top.join(' · ')}`
@@ -580,7 +597,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
   if (input.selfTest.ok) {
     // ⚠ 守卫是刻意的：库**读不到**时 `hypotheses` 也是空数组，直接渲染会把「读不到」印成
     // 「无假设」（两种情形必须长得不一样——本模块头部那条纪律）。不可用时交给 notes 说。
-    lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses)))
+    lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses), input.rulesInBlock))
     // 信号面与推进面**同守卫**：库读不到时两者一起缺席（「读不到」不许印成「全部采到」）
     lines.push(signalLine(starvationOf(hypotheses, now)))
     // 承诺面（使能型声明）：与上两面同守卫——库读不到时一并缺席

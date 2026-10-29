@@ -33,7 +33,7 @@ import { compareCandidates, describeChoice } from './candidate-choice.js'
 import { selectParentAgent } from './parent.js'
 import { listRuns, loadLedger, loadSelfTestState, resolveLegacyPaths, type LegacyPaths } from './store.js'
 import { buildStatus, selfRewriteSnapshot, type ArtifactStat, type SelfRewriteSnapshot } from './status.js'
-import { applyBlockSet, applyRuleUpsertWithRecycle, byteLength, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
+import { applyBlockSet, applyRuleUpsertWithRecycle, byteLength, extractBlockInner, findBlock, MANAGED_BLOCKS, RECYCLE_POINTER_PREFIX, splitEntries, type RecycleWriteOutcome, type WriteOutcome } from './wiring.js'
 import { runGate } from './gate-io.js'
 import { gateTraceLine } from './gate.js'
 import {
@@ -319,6 +319,33 @@ export function choiceLines(
  * 反过来就成了「条目已迁出但无处可寻」。反向失败（归档成功、写段失败）只产生重复——
  * **宁可重复，不可丢失**（同 `upsertRuleBlock` 的方向性）。
  */
+/**
+ * 数 `rulesBlockId` 段内**当前规则条数**（2026-10-29 加）。
+ *
+ * 为什么需要：`daysSinceWired` 测的是「最新一条 confirmed 假设的 `updatedAt`」，**不是写段时刻**。
+ * 没有这个读数，「最后布线 38 天前」会被读成「段里有一堆 38 天前写的规则」——而 2026-10-29 实测
+ * 段内 **0 条**（规则已迁去正文，见台账 `lh-2b453836`）。两个读数同时在，才答得出
+ * 「布线环是没跑」还是「跑了但产物被搬走了」。
+ *
+ * 口径与写入端**同体**：复用同一份 `splitEntries`，并同样剥掉回收指针行
+ * （指针是**状态**不是条目——写入端 `applyRuleUpsertWithRecycle` 就是这么分的）。
+ * 段读不到 / 块定义不存在 ⇒ `null`（**不是 0**：「段空」与「段读不到」必须分得开）。
+ */
+function countRulesInBlock(path: string, blockId: string): number | null {
+  try {
+    if (!existsSync(path)) return null
+    const full = readFileSync(path, 'utf8')
+    const block = findBlock(blockId)
+    if (block === undefined) return null
+    const inner = extractBlockInner(full, block)
+    if (inner === undefined) return null
+    return splitEntries(inner).filter((line) => !line.startsWith(RECYCLE_POINTER_PREFIX)).length
+  } catch {
+    // 观测绝不反噬主流程（§5.22）：读段失败只让读数缺席，不让状态查询本身失败
+    return null
+  }
+}
+
 function appendArchive(archivePath: string, entries: readonly string[], blockId: string): void {
   const date = new Date().toISOString().slice(0, 10)
   const body = entries.map((e) => '- [' + date + ' · ' + blockId + '] ' + e).join('\n')
@@ -464,6 +491,7 @@ export function apply(ctx: Context, config: Config): void {
         ledger: loadLedger(paths),
         runs: listRuns(paths),
         artifacts: artifactsOf(sinkEnv),
+        rulesInBlock: countRulesInBlock(rulesPath, config.rulesBlockId),
       }, new Date())
       const lines = [report.text]
       const state = loadSelfTestState(paths)
