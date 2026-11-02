@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 
-import { decideGate, hashRuleDraft, type GateDecision, type SealedAccount } from './gate.js'
+import { canaryProbe, decideGate, hashRuleDraft, type CanaryResult, type GateDecision, type SealedAccount } from './gate.js'
 
 /** 冻结账根目录（相对 DSH_HOME） */
 export const SEALED_ROOT = 'acceptance-sealed'
@@ -56,8 +56,27 @@ export function runScript(scriptPath: string, home: string): number | null {
 
 /**
  * 完整闸门（取数 + 裁决）。**任何异常都不许变成「通过」**（fail-closed）。
+ *
+ * 第一拍是**金丝雀自检**：闸门可能已被改成 fail-open 而无人察觉——
+ * 尤其在本机「真实调用次数为 0」的现状下，没有任何读数会因此变化
+ * ⇒ 每次调用先证明门还在工作，再让它裁决真实候选。
+ *
+ * @param canary 自检函数（缺省真品；测试注入坏门来证明自检抓得住）
  */
-export function runGate(home: string, ruleId: string, draft: string): GateDecision {
+export function runGate(
+  home: string,
+  ruleId: string,
+  draft: string,
+  canary: () => CanaryResult = canaryProbe,
+): GateDecision {
+  const self = canary()
+  if (!self.healthy) {
+    return {
+      accepted: false,
+      stage: 'canary-failed',
+      reason: `闸门自检失败（${self.reason}）——门已不可信，一律 fail-closed`,
+    }
+  }
   const hash = hashRuleDraft(draft)
   let account: SealedAccount | null = null
   try {

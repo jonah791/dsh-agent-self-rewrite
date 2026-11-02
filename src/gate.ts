@@ -43,7 +43,7 @@ export interface SealedAccount {
 export interface GateDecision {
   accepted: boolean
   /** 阶段枚举（可诊断「断在哪一段」，不是笼统 error） */
-  stage: 'no-account' | 'hash-mismatch' | 'no-oracle' | 'injector-nonzero' | 'benign-nonzero' | 'passed'
+  stage: 'canary-failed' | 'no-account' | 'hash-mismatch' | 'no-oracle' | 'injector-nonzero' | 'benign-nonzero' | 'passed'
   /** 唯一附加信息：为什么拒（接受时为空串） */
   reason: string
 }
@@ -139,4 +139,77 @@ export function gateTraceLine(ruleId: string, d: GateDecision, at: string): stri
     stage: d.stage,
     reason: d.reason,
   })
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 金丝雀自检（2026-11-03 · t-366b5933）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 金丝雀账户的保留 id——不与真实假设 id 形态冲突（真实 id 形如 `h-xxxxxxxx-1`） */
+export const CANARY_RULE_ID = '__gate-canary__'
+
+/** 金丝雀账户的哈希：故意是不可达的常量，任何真实草稿都不会撞上 */
+const CANARY_HASH = 'djb2:canary-never-matches'
+
+/** 金丝雀自检结果 */
+export interface CanaryResult {
+  /** 闸门在四个角落上都给出了正确裁决 */
+  healthy: boolean
+  /** 不健康时说清哪一格坏了（健康时为空串） */
+  reason: string
+}
+
+/**
+ * 金丝雀自检：**闸门自己是否还在工作**。
+ *
+ * 判据形状借 arXiv:2609.02246 的「满分本身就是作弊的证据」——
+ * 金丝雀是一组**必然该被拒**的账户形态，它的**通过**就是闸门失效的证据。
+ * ⇒ 这里「被接受」等于「作弊」；健康的信号是**它被拒绝**。
+ *
+ * **本机的真实缺口（这是它存在的理由）**：闸门实现于 2026-10-17，但
+ * `.dsh/acceptance-sealed/` 至今为空、`acceptance-gate-trace.jsonl` 不存在
+ * ⇒ 真实运行次数 **0**。零读数的门无法自证还在工作：它可能已被改成 fail-open
+ * （改了 `decideGate` 的某个分支）而**没有任何读数会变**——因为没有任何一次调用。
+ *
+ * **四个角落**（两侧都测，缺一即可被「恒拒」或「恒受」骗过）：
+ * ① 无冻结账 ⇒ 必须拒　　　② 哈希不符 ⇒ 必须拒
+ * ③ 注入器没变红 ⇒ 必须拒　④ **正常形态 ⇒ 必须接受**
+ *
+ * ⚠ 只测 ①②③ 的话，「拒绝一切」也能满分（`acceptance-integrity` 承重判据 6）。
+ * ④ 是防这一点的；它的代价是金丝雀必须承认「闸门确实会通过学习形态」。
+ *
+ * @param decide 裁决函数（缺省真品；测试可注入替身来证明金丝雀抓得住坏门）
+ */
+export function canaryProbe(decide: (a: SealedAccount | null, h: string, i: number | null, b: number | null) => GateDecision = decideGate): CanaryResult {
+  const good: SealedAccount = {
+    ruleId: CANARY_RULE_ID,
+    sealedAt: '1970-01-01T00:00:00.000Z',
+    ruleDraftHash: CANARY_HASH,
+    kind: 'executable',
+    injector: { script: '<canary>' },
+    benign: { script: '<canary>' },
+    expect: { injected: 1, benign: 0 },
+  }
+
+  // ① 无冻结账：这是「外生」的最外一圈，被接受 ⇒ 任何人都能绕过冻结
+  if (decide(null, CANARY_HASH, 1, 0).accepted) {
+    return { healthy: false, reason: '无冻结账却被接受——外生性整条失效（fail-open）' }
+  }
+  // ② 落账后改过规则：被接受 ⇒ 「不可为这次改动定制」这条约束失效
+  if (decide(good, hashRuleDraft('canary-draft-that-differs'), 1, 0).accepted) {
+    return { healthy: false, reason: '哈希不符却被接受——冻结变可改，外生性只剩时序' }
+  }
+  // ③ 注入器构造不出失败（退出码 0）：被接受 ⇒ phantom 规则的生成机制复活
+  if (decide(good, CANARY_HASH, 0, 0).accepted) {
+    return { healthy: false, reason: '注入器未变红却被接受——phantom（为不存在的失败写规则）会漏过' }
+  }
+  // ④ 良性对照变红：被接受 ⇒ 判据过宽，会把正常情形判成失败
+  if (decide(good, CANARY_HASH, 1, 1).accepted) {
+    return { healthy: false, reason: '良性对照变红却被接受——判据过宽（会把正常情形判成失败）' }
+  }
+  // ⑤ **反向**：正常形态必须被接受。恒拒的门在 ①-④ 上全绿，但它同样没有区分力
+  if (!decide(good, CANARY_HASH, 1, 0).accepted) {
+    return { healthy: false, reason: '正常形态（注入红 + 对照绿 + 账齐 + 哈希符）被拒——闸门恒拒，无区分力' }
+  }
+  return { healthy: true, reason: '' }
 }

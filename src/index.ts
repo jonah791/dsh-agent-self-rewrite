@@ -671,6 +671,51 @@ export function apply(ctx: Context, config: Config): void {
     },
     output: textOut,
     async execute(args: { id: string; verdict: Verdict; ruleDraft?: string; newStatement?: string; newThreshold?: number; polarity?: string; resolution?: string }) {
+      // ★ 外生接受位**先行**（2026-11-03 · t-366b5933「验收优先于 Teacher」）
+      //
+      // 顺序为什么是承重的：闸门原先在 `applyVerdict` **之后**跑，被拒时状态已落盘
+      // ⇒ 留下「假设 confirmed、规则却不在 AGENTS.md」的脏状态（Accepted ≠ effective）。
+      // 权威顺序是「验收优先于 Teacher」：确定性层说不行 ⇒ **裁决不发生**，
+      // 而不是「裁决发生了，只是布线被拦」。
+      const draft = args.ruleDraft
+      const wantsWiring = args.verdict === 'confirm' && draft !== undefined && draft.trim().length > 0
+      let gateBypassed = false
+      if (wantsWiring && draft !== undefined) {
+        if (config.acceptanceGate) {
+          const decision = runGate(dshHome, args.id, draft)
+          try {
+            appendFileSync(
+              join(dshHome, 'acceptance-gate-trace.jsonl'),
+              gateTraceLine(args.id, decision, new Date().toISOString()) + '\n',
+              'utf8',
+            )
+          } catch {
+            // 轨迹落盘失败不阻断（观测绝不反噬主流程），但下一行的「没留痕」是已知盲区
+          }
+          if (!decision.accepted) {
+            return {
+              text: '⛔ **外生接受位拒绝**（' + decision.stage + '）：' + decision.reason
+                + '\n\n**本次裁决未发生**——闸门在状态变更之前跑，假设状态未改动，规则未写入 AGENTS.md。'
+                + '修正后重新 confirm 即可（不是「再试一次」，是「按拒因改完再走」）。'
+                + '\n冻结账形态：`<DSH_HOME>/acceptance-sealed/<ruleId>.json`；设计见 `docs/design/exogenous-acceptance-gate.md`',
+            }
+          }
+        } else {
+          // 开关关闭 ⇒ **验收没有优先于 Teacher**。不禁止（紧急时可能需要），
+          // 但**不许静默**：留痕 + 输出带警告 ⇒ 绕过本身可审。
+          gateBypassed = true
+          try {
+            appendFileSync(
+              join(dshHome, 'acceptance-gate-trace.jsonl'),
+              JSON.stringify({ at: new Date().toISOString(), ruleId: args.id, accepted: null, stage: 'bypassed', reason: 'config.acceptanceGate=false' }) + '\n',
+              'utf8',
+            )
+          } catch {
+            // 同上：留痕失败不阻断，但那条「本轮未过闸」的警告仍会出现在输出里
+          }
+        }
+      }
+
       const state = requireHypotheses(paths)
       const outcome = applyVerdict(state, {
         id: args.id,
@@ -685,31 +730,6 @@ export function apply(ctx: Context, config: Config): void {
 
       let wired = ''
       if (outcome.needsWiring && args.ruleDraft !== undefined) {
-        // ★ 外生接受位（2026-10-17）：写盘前先过闸。
-        // 写判据的是我、被审的也是我 ⇒ arXiv:2607.24300 的信息论下界直接适用
-        // （α+β ≥ 1−TV(P₊,P₋)：纯内生门不可能把两个错误都做小，这是结构问题不是纪律问题）。
-        // 闸门中「在我控制之外」的部分 = 冻结账在写规则**之前**落盘且只读 ⇒ 不能为这次改动定制。
-        if (config.acceptanceGate) {
-          const decision = runGate(dshHome, args.id, args.ruleDraft)
-          try {
-            appendFileSync(
-              join(dshHome, 'acceptance-gate-trace.jsonl'),
-              gateTraceLine(args.id, decision, new Date().toISOString()) + '\n',
-              'utf8',
-            )
-          } catch {
-            // 轨迹落盘失败不阻断（观测绝不反噬主流程 · §5.22）
-          }
-          if (!decision.accepted) {
-            return {
-              text:
-                '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status
-                + '\n⛔ **外生接受位拒绝**（' + decision.stage + '）：' + decision.reason
-                + '\n规则**未写入** AGENTS.md（拒绝的是**布线**，不是裁决本身——假设状态已更新）。'
-                + '\n冻结账形态：`<DSH_HOME>/acceptance-sealed/<ruleId>.json`；设计见 `docs/design/exogenous-acceptance-gate.md`',
-            }
-          }
-        }
         const full = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf8') : ''
         const pointerFor = (n: number): string =>
           RECYCLE_POINTER_PREFIX + ' 已回收 ' + String(n) + ' 条至 ' + relArchive + '（' + new Date().toISOString().slice(0, 10) + '）'
@@ -736,6 +756,10 @@ export function apply(ctx: Context, config: Config): void {
         text: '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status
           + '（证据 ' + String(outcome.hypothesis.evidence.length) + ' 条；方向 ' + outcome.direction.direction + '）'
           + wired
+          + (gateBypassed
+            ? '\n⚠ **本轮未过外生接受位**（config.acceptanceGate=false）——规则已写入，但没有任何冻结点为它担保。'
+              + '这条警告是刻意的：绕过本身可审，不留痕的绕过才是危险的。'
+            : '')
           + (outcome.polarityWarning !== null ? '\n' + outcome.polarityWarning : '')
           + (outcome.emptyRefuteWarning !== null ? '\n' + outcome.emptyRefuteWarning : ''),
       }
