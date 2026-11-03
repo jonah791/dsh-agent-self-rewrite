@@ -52,12 +52,22 @@ export interface StatusInput {
   /**
    * `rulesBlockId` 段内**当前规则条数**：`null` = 段读不到，`undefined` = 调用方没提供（不渲染）。
    *
-   * 存在理由（2026-10-29）：`daysSinceWired` 测的是「最新一条 confirmed 假设的 `updatedAt`」，
+   * 存在理由（2026-10-29）：`daysSinceConfirmed` 测的是「最新一条 confirmed 假设的 `updatedAt`」，
    * **不是写段时刻**。少了这个读数，读者无法区分「38 天前真的布过线」与「38 天前 confirm 过、
    * 而段里其实一条规则都没有」——2026-10-29 实测的真相是后者（台账 `lh-2b453836`）。
    * 三态互不掩盖：没提供（不渲染）/ 读不到（说「读不到」）/ 0 条（说「0 条」）。
    */
   readonly rulesInBlock?: number | null
+  /**
+   * 载体（受管注入面文档，如 AGENTS.md）的**最后修改时刻**（ISO）。
+   *
+   * 为什么它必须与 `lastConfirmedAt` **并列**而不是互相替代（2026-11-03 · lh-32790460）：
+   * 前者量「文件被碰过」，后者量「假设被裁决过」。两者可以分离，而且**我见过分离**——
+   * `h-mvzxyz4w-1` 的内容 2026-11-03 才写进 AGENTS.md §3.4 正文，而它的 confirm 停在
+   * 43 天前。只报后者会把「今天布过线」说成「43 天没布线」（低估 43 天）。
+   * 三态同 `rulesInBlock`：没提供（不渲染）/ `null`（明说读不到）/ 有值。
+   */
+  readonly carrierWriteAt?: string | null
 }
 
 export interface StatusCounts {
@@ -173,12 +183,26 @@ export function statusBreakdown(runs: readonly RunRecord[]): string {
  * 且天数一律为 `null` 而不是 0（0 天 = 今天刚动过，与「算不出来」是两回事）。
  */
 export interface Staleness {
-  /** 最新一条 `confirmed` 假设的 `updatedAt`（近似「最后布线时刻」）；无 confirmed ⇒ `null` */
-  readonly lastWiredAt: string | null
+  /**
+   * 最新一条**普通** `confirmed` 假设的 `updatedAt`——「最后一次 confirm」。
+   *
+   * ⚠ 原名 `lastWiredAt`（2026-11-03 改 · lh-32790460）：它量的是「假设被裁决的时刻」，
+   * **不是布线**。布线 = 认知写进会被读的地方（AGENTS.md 正文 / 技能 / 记忆），而那条
+   * 路径**不经过 confirm**——我手工把 `h-mvzxyz4w-1` 的结论写进 AGENTS.md §3.4 是
+   * 2026-11-03，而它的 confirm 停在 43 天前 ⇒ 旧名字把「今天布过线」报成「43 天没布线」。
+   * 想读「载体被碰的时刻」看 `carrierWriteAt`：**两个域，不可互推**。
+   */
+  readonly lastConfirmedAt: string | null
+  /**
+   * 载体最后修改时刻（ISO）。量的是「文件被碰过」——改个错别字也算，所以它**不等于布了线**。
+   * `null` = 读不到（文件不存在 / 调用方没提供）——**不是「刚改过」**。
+   */
+  readonly carrierWriteAt: string | null
   /** 全部证据里最新的 `ts`（最后采证时刻）；无证据 ⇒ `null` */
   readonly lastEvidenceAt: string | null
   /** 距今天数（向下取整）；无对应时刻 ⇒ `null`（**不是 0**） */
-  readonly daysSinceWired: number | null
+  readonly daysSinceConfirmed: number | null
+  readonly daysSinceCarrier: number | null
   readonly daysSinceEvidence: number | null
   /** 在采证的假设数（`active`）——**0 条 = 采证链断**，这是停滞的根因，比天数更该看 */
   readonly collecting: number
@@ -194,16 +218,16 @@ function daysSince(iso: unknown, now: Date): number | null {
   return Math.floor((now.getTime() - t) / DAY_MS)
 }
 
-export function stalenessOf(hypotheses: readonly Hypothesis[], now: Date): Staleness {
-  let lastWired: string | null = null
+export function stalenessOf(hypotheses: readonly Hypothesis[], now: Date, carrierWriteAt: string | null = null): Staleness {
+  let lastConfirmed: string | null = null
   let lastEvidence: string | null = null
   let collecting = 0
   for (const h of hypotheses) {
     if (h.status === 'active') collecting += 1
     // ⚠ 只数**普通** confirmed：使能型声明兑现后也是 confirmed，但它不是「布线」——
-    // 计入会让「最后布线」看起来比实际新（假活读数，而这一面存在的理由正是抓假活）。
+    // 计入会让「最后 confirm」看起来比实际新（假活读数，而这一面存在的理由正是抓假活）。
     if (h.status === 'confirmed' && h.enabling === undefined && typeof h.updatedAt === 'string' && h.updatedAt.length > 0) {
-      if (lastWired === null || Date.parse(h.updatedAt) > Date.parse(lastWired)) lastWired = h.updatedAt
+      if (lastConfirmed === null || Date.parse(h.updatedAt) > Date.parse(lastConfirmed)) lastConfirmed = h.updatedAt
     }
     for (const ev of h.evidence ?? []) {
       const ts = (ev as { ts?: unknown }).ts
@@ -213,9 +237,11 @@ export function stalenessOf(hypotheses: readonly Hypothesis[], now: Date): Stale
     }
   }
   return {
-    lastWiredAt: lastWired,
+    lastConfirmedAt: lastConfirmed,
+    carrierWriteAt,
     lastEvidenceAt: lastEvidence,
-    daysSinceWired: daysSince(lastWired, now),
+    daysSinceConfirmed: daysSince(lastConfirmed, now),
+    daysSinceCarrier: daysSince(carrierWriteAt, now),
     daysSinceEvidence: daysSince(lastEvidence, now),
     collecting,
   }
@@ -442,16 +468,23 @@ function signalLine(s: Starvation): string {
 
 /** 推进面的渲染（纯文本层；不可用时不渲染——那是 `notes` 的职责，不许两处都说同一件事） */
 function advanceLine(stale: Staleness, queue: readonly AdvanceRow[], rulesInBlock?: number | null): string {
-  if (stale.lastWiredAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0) {
+  if (stale.lastConfirmedAt === null && stale.lastEvidenceAt === null && stale.collecting === 0 && queue.length === 0 && stale.carrierWriteAt === null) {
     return '推进面：无假设——五环的「猜想」环当前无内容'
   }
-  // ⚠ 口径（2026-10-29 补）：`lastWiredAt` 是「最新一条 confirmed 假设的 `updatedAt`」，
-  // **不是写 AGENTS.md 段的时刻**。不标出来会被读成「最近一次真的布了线」——而实测段内可能
-  // 一条规则都没有（规则已迁去正文，见台账 lh-2b453836）。标注只让读数**诚实**，
-  // 不改变它仍报「38 天前」这个事实（红=设计，不为消红改判据）。
-  const wired = stale.lastWiredAt === null
-    ? '从未布线'
-    : `最后布线 ${String(stale.daysSinceWired ?? '?')} 天前（${stale.lastWiredAt.slice(0, 10)}·按 confirm 时刻近似）`
+  // ⚠ 口径（2026-11-03 拆名 · lh-32790460）：旧版把「最新一条 confirmed 的 updatedAt」
+  // 渲染成「最后布线 N 天前（·按 confirm 时刻近似）」。**加一个括号标注不够**——读者
+  // 拿到的仍是「N 天没布线」这个结论，而它是错的：2026-11-03 实测，`h-mvzxyz4w-1` 的
+  // 内容当天才写进 AGENTS.md §3.4 正文，而读数报「43 天前」⇒ 低估 43 天。
+  // 现在并列两个**各自真实**的读数、各标各的名，由我看着两个数自己判：
+  //   · 最后 confirm —— 假设库的推进（引擎自动写入路径走没走通）
+  //   · 载体最后修改 —— 注入面文档被碰过（手工布正文也算；但它也数改错别字）
+  // 两个域不可互推，所以**不给单一结论**。
+  const confirmed = stale.lastConfirmedAt === null
+    ? '从未 confirm'
+    : `最后 confirm ${String(stale.daysSinceConfirmed ?? '?')} 天前（${stale.lastConfirmedAt.slice(0, 10)}）`
+  const carrier = stale.carrierWriteAt === null
+    ? '载体时刻读不到'
+    : `载体最后修改 ${String(stale.daysSinceCarrier ?? '?')} 天前`
   const evidence = stale.lastEvidenceAt === null
     ? '从未采证'
     : `最后采证 ${String(stale.daysSinceEvidence ?? '?')} 天前`
@@ -459,14 +492,14 @@ function advanceLine(stale: Staleness, queue: readonly AdvanceRow[], rulesInBloc
     ? '在采证 0 条（**采证链停**：没有 active 假设，探针不会积累证据）'
     : `在采证 ${String(stale.collecting)} 条`
   // 段内规则数（2026-10-29）：三态**互不掩盖**——未提供不渲染（老调用方形状不变）/
-  // 读不到（说读不到）/ 0 条 / N 条。没有它，「最后布线 38 天前」会被读成「段里有一堆
+  // 读不到（说读不到）/ 0 条 / N 条。没有它，「最后 confirm 38 天前」会被读成「段里有一堆
   // 38 天前写的规则」，而实测段内 0 条（台账 lh-2b453836）。
   const rules = rulesInBlock === undefined
     ? null
     : rulesInBlock === null
       ? '段内规则数**读不到**'
       : `段内 **${String(rulesInBlock)}** 条规则`
-  const head = `推进面：${wired}${rules === null ? '' : ' · ' + rules} · ${evidence} · ${collecting}`
+  const head = `推进面：${confirmed} · ${carrier}${rules === null ? '' : ' · ' + rules} · ${evidence} · ${collecting}`
   if (queue.length === 0) return head
   const top = queue.slice(0, 3).map((r) => `${r.id} ${String(r.evidence)}/${String(r.threshold)}`)
   return head + `\n  最接近阈值（归一化缺口升序）：${top.join(' · ')}`
@@ -502,7 +535,8 @@ function promiseLine(rows: readonly PromiseRow[]): string {
  */
 export interface SelfRewriteSnapshot {
   readonly at: string
-  readonly daysSinceWired: number | null
+  readonly daysSinceConfirmed: number | null
+  readonly daysSinceCarrier: number | null
   readonly daysSinceEvidence: number | null
   readonly collecting: number
   /** 零证据假设数（**信号饥饿**：请求了 N 条证据、落点 0 条） */
@@ -526,7 +560,7 @@ export function selfRewriteSnapshot(hypotheses: readonly Hypothesis[], now: Date
   const queue = advanceQueue(hypotheses)
   const starve = starvationOf(hypotheses, now)
   const next = queue.length > 0 ? (queue[0] as AdvanceRow) : null
-  const wired = stale.daysSinceWired === null ? '从未布线' : `最后布线 ${String(stale.daysSinceWired)} 天前`
+  const wired = stale.daysSinceConfirmed === null ? '从未 confirm' : `最后 confirm ${String(stale.daysSinceConfirmed)} 天前`
   const evidence = stale.daysSinceEvidence === null ? '从未采证' : `最后采证 ${String(stale.daysSinceEvidence)} 天前`
   const starved = starve.zeroEvidence === 0 ? '' : ` · 零证据 ${String(starve.zeroEvidence)} 条`
   const line = `${wired} · ${evidence} · 在采证 ${String(stale.collecting)} 条${starved}`
@@ -544,7 +578,8 @@ export function selfRewriteSnapshot(hypotheses: readonly Hypothesis[], now: Date
       : (next === null ? null : `最接近阈值：${next.id} ${String(next.evidence)}/${String(next.threshold)}`))
   return {
     at: now.toISOString(),
-    daysSinceWired: stale.daysSinceWired,
+    daysSinceConfirmed: stale.daysSinceConfirmed,
+    daysSinceCarrier: stale.daysSinceCarrier,
     daysSinceEvidence: stale.daysSinceEvidence,
     collecting: stale.collecting,
     starved: starve.zeroEvidence,
@@ -604,7 +639,7 @@ export function buildStatus(input: StatusInput, now: Date = new Date()): StatusR
   if (input.selfTest.ok) {
     // ⚠ 守卫是刻意的：库**读不到**时 `hypotheses` 也是空数组，直接渲染会把「读不到」印成
     // 「无假设」（两种情形必须长得不一样——本模块头部那条纪律）。不可用时交给 notes 说。
-    lines.push(advanceLine(stalenessOf(hypotheses, now), advanceQueue(hypotheses), input.rulesInBlock))
+    lines.push(advanceLine(stalenessOf(hypotheses, now, input.carrierWriteAt ?? null), advanceQueue(hypotheses), input.rulesInBlock))
     // 信号面与推进面**同守卫**：库读不到时两者一起缺席（「读不到」不许印成「全部采到」）
     lines.push(signalLine(starvationOf(hypotheses, now)))
     // 承诺面（使能型声明）：与上两面同守卫——库读不到时一并缺席

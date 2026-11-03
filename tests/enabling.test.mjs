@@ -91,13 +91,13 @@ test('承诺面：只列 pending，按年龄降序；兑现后即消失（兑现
   assert.equal(after[0].id, newOne.id)
 })
 
-test('假活防护：兑现后的 confirmed **不计入「最后布线」**（它是承诺，不是规则布线）', () => {
+test('假活防护：兑现后的 confirmed **不计入「最后 confirm」**（它是承诺，不是规则布线）', () => {
   const state = fresh()
   const en = addEnabling(state)
   fulfillHypothesis(state, { id: en.id }, new Date('2026-10-16T00:00:00Z'))
   const stale = stalenessOf(state.hypotheses, new Date('2026-10-20T00:00:00Z'))
-  assert.equal(stale.lastWiredAt, null, '使能型声明的兑现不得让「最后布线」看起来变新')
-  assert.equal(stale.daysSinceWired, null)
+  assert.equal(stale.lastConfirmedAt, null, '使能型声明的兑现不得让「最后 confirm」看起来变新')
+  assert.equal(stale.daysSinceConfirmed, null)
 })
 
 test('计数：pending 独立一档，不并入 active（并入会掩盖「采证链停」）', () => {

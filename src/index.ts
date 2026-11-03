@@ -17,7 +17,7 @@
  * @module dsh-agent-self-rewrite
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -322,8 +322,8 @@ export function choiceLines(
 /**
  * 数 `rulesBlockId` 段内**当前规则条数**（2026-10-29 加）。
  *
- * 为什么需要：`daysSinceWired` 测的是「最新一条 confirmed 假设的 `updatedAt`」，**不是写段时刻**。
- * 没有这个读数，「最后布线 38 天前」会被读成「段里有一堆 38 天前写的规则」——而 2026-10-29 实测
+ * 为什么需要：`daysSinceConfirmed` 测的是「最新一条 confirmed 假设的 `updatedAt`」，**不是写段时刻**。
+ * 没有这个读数，「最后 confirm 38 天前」会被读成「段里有一堆 38 天前写的规则」——而 2026-10-29 实测
  * 段内 **0 条**（规则已迁去正文，见台账 `lh-2b453836`）。两个读数同时在，才答得出
  * 「布线环是没跑」还是「跑了但产物被搬走了」。
  *
@@ -342,6 +342,26 @@ function countRulesInBlock(path: string, blockId: string): number | null {
     return splitEntries(inner).filter((line) => !line.startsWith(RECYCLE_POINTER_PREFIX)).length
   } catch {
     // 观测绝不反噬主流程（§5.22）：读段失败只让读数缺席，不让状态查询本身失败
+    return null
+  }
+}
+
+/**
+ * 载体（受管注入面文档）的**最后修改时刻**，ISO；读不到 ⇒ `null`（2026-11-03 · lh-32790460）。
+ *
+ * 为什么需要第二个时刻：`stalenessOf` 报的「最后 confirm」量的是**假设被裁决**的时刻，
+ * 而布线（认知写进 AGENTS.md 正文 / 技能 / 记忆）那条路径**不经过 confirm**。
+ * 2026-11-03 实测分离：`h-mvzxyz4w-1` 的内容当天才写进 AGENTS.md §3.4 正文，而它的
+ * confirm 停在 43 天前 ⇒ 旧读数「最后布线 43 天前」把「今天布过线」说成「43 天没布线」。
+ *
+ * ⚠ 它量的是「文件被碰过」——改个错别字也算，所以**不等于布了线**。两个读数并列，
+ * 判断（「布线环是没跑还是跑了被搬走」）归读的人，本函数不替他下结论。
+ */
+function statMtimeIso(path: string): string | null {
+  try {
+    if (!existsSync(path)) return null
+    return statSync(path).mtime.toISOString()
+  } catch {
     return null
   }
 }
@@ -492,6 +512,7 @@ export function apply(ctx: Context, config: Config): void {
         runs: listRuns(paths),
         artifacts: artifactsOf(sinkEnv),
         rulesInBlock: countRulesInBlock(rulesPath, config.rulesBlockId),
+        carrierWriteAt: statMtimeIso(rulesPath),
       }, new Date())
       const lines = [report.text]
       const state = loadSelfTestState(paths)

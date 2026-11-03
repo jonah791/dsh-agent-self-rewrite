@@ -217,7 +217,7 @@ test('端到端：夹具目录里真写 run 文件 ⇒ collectStatus 读数与�
 
 const fixedNow = new Date('2026-10-15T12:00:00.000Z')
 // ⚠ `h()` 工厂**不含 `updatedAt`**（它是全量状态测试用的最小形状）——而 `stalenessOf` 正是读它，
-// 所以这里必须补上：漏了它，`lastWiredAt` 会**正确地**返回 null（2026-10-15 实测：两条红都源于此，
+// 所以这里必须补上：漏了它，`lastConfirmedAt` 会**正确地**返回 null（2026-10-15 实测：两条红都源于此，
 // 是**夹具不完整**而不是实现缺陷）。
 const withEv = (status, evCount, thr, ts, updatedAt) => ({
   ...h(status),
@@ -228,10 +228,13 @@ const withEv = (status, evCount, thr, ts, updatedAt) => ({
 
 test('stalenessOf：库空 ⇒ 天数全为 null（**不是 0**——「今天动过」与「算不出来」是两件事）', () => {
   const s = stalenessOf([], fixedNow)
-  assert.equal(s.lastWiredAt, null)
-  assert.equal(s.daysSinceWired, null)
+  assert.equal(s.lastConfirmedAt, null)
+  assert.equal(s.daysSinceConfirmed, null)
   assert.equal(s.daysSinceEvidence, null)
   assert.equal(s.collecting, 0)
+  // 载体时刻是**另一个域**：库空不影响它，没提供就只能是 null（不是「刚改过」）
+  assert.equal(s.carrierWriteAt, null, '调用方未提供载体时刻 ⇒ null')
+  assert.equal(s.daysSinceCarrier, null)
 })
 
 test('stalenessOf：天数按 now 现算；在采证数**只数 active**（终态假设不算在采证）', () => {
@@ -241,8 +244,8 @@ test('stalenessOf：天数按 now 现算；在采证数**只数 active**（终�
     withEv('refuted', 5, 5, '2026-08-01T00:00:00.000Z'),
   ]
   const s = stalenessOf(hs, fixedNow)
-  assert.equal(s.lastWiredAt, '2026-09-20T16:10:00.000Z')
-  assert.equal(s.daysSinceWired, 24, '09-20T16:10Z → 10-15T12:00Z = 24 天 19h50m ⇒ 向下取整 24')
+  assert.equal(s.lastConfirmedAt, '2026-09-20T16:10:00.000Z')
+  assert.equal(s.daysSinceConfirmed, 24, '09-20T16:10Z → 10-15T12:00Z = 24 天 19h50m ⇒ 向下取整 24')
   assert.equal(s.lastEvidenceAt, '2026-09-25T00:00:00.000Z')
   assert.equal(s.daysSinceEvidence, 20)
   assert.equal(s.collecting, 1)
@@ -280,7 +283,7 @@ test('推进面三态不许同貌：库空 / 有布线 / 采证链停 各说各�
     ledger: ok({ resources: {} }),
     runs: [],
   }, fixedNow)
-  assert.ok(stopped.text.includes('最后布线 24 天前'), '天数必须出现在推进面')
+  assert.ok(stopped.text.includes('最后 confirm 24 天前'), '天数必须出现在推进面')
   assert.ok(stopped.text.includes('在采证 0 条'), '0 条必须与「读不到」分开')
   assert.ok(stopped.text.includes('采证链停'), '停滞的**根因**是采证链停，不是天数')
 
@@ -294,24 +297,40 @@ test('推进面三态不许同貌：库空 / 有布线 / 采证链停 各说各�
   assert.ok(!live.text.includes('采证链停'), '有 active 时不得报链停')
 })
 
-// ── 2026-10-29 加：布线读数必须自报口径（台账 lh-2b453836） ──────────
-// 存在理由：`lastWiredAt` 取的是「最新一条 confirmed 假设的 updatedAt」，**不是写 AGENTS.md 段的时刻**。
-// 2026-10-29 实测：两个自动段内 0 条规则（规则已迁去正文），而读数仍报「最后布线 38 天前」
-// ⇒ 读者会以为「最近真的布过线」。口径标注只让读数诚实，不把红改绿（confirm 仍 38 天前）。
-test('布线读数标注口径：不得让 confirm 时刻冒充写段时刻', () => {
+// ── 2026-11-03 加：两个时刻必须并列，不许一个冒充另一个（台账 lh-32790460） ──
+// 旧方案（2026-10-29）是把「最新一条 confirmed 的 updatedAt」渲染成「最后布线 N 天前」，
+// 再挂一个「·按 confirm 时刻近似」的括号标注来诚实。**标注不够**——读者拿到的仍是
+// 「N 天没布线」这个结论，而它是错的：`h-mvzxyz4w-1` 的内容 2026-11-03 才写进 AGENTS.md
+// §3.4 正文，而它的 confirm 停在 43 天前 ⇒ 旧读数低估 43 天。
+// 现在两个域各自标名、并列输出，判断归读的人。
+test('★两个时刻必须并列且各自标名：confirm ≠ 载体修改', () => {
+  const r = buildStatus({
+    selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z')] }),
+    ledger: ok({ resources: {} }),
+    runs: [],
+    carrierWriteAt: '2026-10-15T06:00:00.000Z', // 比 confirm 新 24 天：分离场景
+  }, fixedNow)
+  assert.ok(r.text.includes('最后 confirm 24 天前'), '① 假设库的推进')
+  assert.ok(r.text.includes('载体最后修改 0 天前'), '② 载体被碰的时刻（同日 6h 前 ⇒ 向下取整 0）')
+  assert.ok(
+    !r.text.includes('最后布线'),
+    '「布线」这个词不许再出现——它同时指两个不同的东西，叫一个名字就必然骗一半人',
+  )
+})
+
+test('★尸体：未提供载体时刻 ⇒ 说「读不到」，不许印成「刚改过」', () => {
   const r = buildStatus({
     selfTest: ok({ hypotheses: [withEv('confirmed', 3, 3, '2026-09-20T16:10:00.000Z')] }),
     ledger: ok({ resources: {} }),
     runs: [],
   }, fixedNow)
-  assert.ok(
-    r.text.includes('按 confirm 时刻近似'),
-    '口径标注必须出现——否则「最后布线 24 天前」会被读成「最近一次写段」',
-  )
+  assert.ok(r.text.includes('载体时刻读不到'), '缺席必须说出来（§5.9 空要分型）')
+  assert.ok(!r.text.includes('载体最后修改 0 天前'), '读不到 ≠ 刚改过')
+  assert.ok(r.text.includes('最后 confirm 24 天前'), '另一个域不受影响')
 })
 
 // ── 2026-10-29 加：段内规则数四态（台账 lh-2b453836） ──────────────
-// 存在理由：只有「最后布线 N 天前」时，读者分不出「38 天前布过线」与
+// 存在理由：只有「最后 confirm N 天前」时，读者分不出「38 天前布过线」与
 // 「38 天前 confirm 过、段里其实一条规则都没有」。两个读数同框才答得出。
 // 四态互不掩盖是刻意的：未提供（不渲染）/ 读不到 / 0 条 / N 条——
 // 「0 条」是读数，「读不到」是失明，印成同一句就分不清了。
