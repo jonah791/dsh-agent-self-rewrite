@@ -170,4 +170,31 @@ export interface RunState {
   expectedMs?: number
   /** 被收尸的痕迹（件 3）：收尸不留痕 = 又一次静默失效。 */
   reaped?: { at: string; reason: string }
+  /**
+   * 本轮**预算**（与 `startSnapshot` 一起构成「同条件」的两半）。
+   *
+   * 没有它，两次跑无法证明「同预算」——而「同起点 + 同预算的前后对照」是自改进审计里
+   * 唯一能回答「这次改动到底有没有用」的形状。2026-10-27 审计的层 A 结论：该列是 **0 代**，
+   * 而且**不是我没做对照，是账本结构上无法表达**（缺起点与预算）。
+   */
+  budget?: RunBudget
+  /**
+   * 本轮**起点**的资源版本快照（resourceId → version），派发时**自动采集**。
+   *
+   * ⚠ **不从工具参数收**：手工填的起点快照没有证据力，而「同起点」正是这一列要能**证明**
+   * 的东西。`EvolveStore.versionOf` 永不返回 undefined（缺资源回 `'v0.0'`），故快照可直接比较。
+   *
+   * 2026-11-03：台账 lh-7603c358 原写「缺 task / budget / startSnapshot 三字段」，现读代码后判
+   * **task 不加**——本引擎的任务恒定（白纸智能体完成 project2_task），加常量字段不增加任何
+   * 区分力；将来支持多任务时再补。
+   */
+  startSnapshot?: Record<string, string>
+}
+
+/** 一轮评测的预算。两项都取自**配置真值**（`RoundConfig`），不是拍出来的数。 */
+export interface RunBudget {
+  /** 官方评测超时（ms），取自 `RoundConfig.evalTimeoutMs` */
+  evalTimeoutMs?: number
+  /** 期望时长（ms），与 `RunState.expectedMs` 同源——放这里让「同预算」一次比完 */
+  expectedMs?: number
 }

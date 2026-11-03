@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { EvolveStore } from './ledger-store.js'
-import type { Borrowing, Ledger, ResourceId, ResourceSink, VersionRef } from './types.js'
+import type { Borrowing, Ledger, ResourceId, ResourceSink, RunBudget, VersionRef } from './types.js'
 import { renderPreset } from './presets.js'
 import { runFullEval } from './evaluator.js'
 import {
@@ -304,7 +304,30 @@ export function assertWorkspaceReady(config: RoundConfig): void {
 }
 
 /** 记录一次派发（run 落盘；sessionId 由调用方从 subagents 拿到） */
-export function recordRun(store: EvolveStore, args: { runId: string; gen: number; sessionId: string; parentSessionId?: string }): void {
+export function recordRun(
+  store: EvolveStore,
+  args: {
+    runId: string
+    gen: number
+    sessionId: string
+    parentSessionId?: string
+    /** 本轮预算（与起点快照一起构成「同条件」的另一半）。缺省不写。 */
+    budget?: RunBudget
+  },
+): void {
+  // 起点快照**自动采集**，不从参数收：手工填的起点快照没有证据力，
+  // 而「同起点」正是「同起点同预算对照」这一列要能**证明**的东西。
+  // 2026-10-27 审计的层 A 结论：账本缺起点与预算 ⇒ 该列结构上无法表达（不是行为缺失）。
+  //
+  // ⚠ **只采集真实存在的资源**：`versionOf` 对「资源不存在」也返回 `'v0.0'`（兜底），
+  // 而真实第一版的版本号恰好**也是 `'v0.0'`** ⇒ 若照抄兜底值，「起点没有这个资源」
+  // 与「资源在 v0.0」在快照里就无法区分了。缺键 = 起点没有它，这是**明确的读数**，
+  // 不是缺失。空账本的快照是 `{}`，同样是读数（起点什么都没有）。
+  const l = store.ensureLedger()
+  const startSnapshot: Record<string, string> = {}
+  for (const id of ['agent-rules', 'candidate-prompt'] as const) {
+    if (l.resources[id] !== undefined) startSnapshot[id] = store.versionOf(l, id)
+  }
   store.writeRun({
     runId: args.runId,
     gen: args.gen,
@@ -313,6 +336,8 @@ export function recordRun(store: EvolveStore, args: { runId: string; gen: number
     at: new Date().toISOString(),
     ...(args.parentSessionId !== undefined ? { parentSessionId: args.parentSessionId } : {}),
     expectedMs: DEFAULT_EXPECTED_MS,
+    ...(args.budget !== undefined ? { budget: args.budget } : {}),
+    startSnapshot,
   })
 }
 

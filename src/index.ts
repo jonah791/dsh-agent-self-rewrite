@@ -834,6 +834,10 @@ export function apply(ctx: Context, config: Config): void {
           gen,
           sessionId: started.childId,
           ...((parent as { id?: string }).id !== undefined ? { parentSessionId: (parent as { id?: string }).id as string } : {}),
+          // 预算从**配置**读，不从工具参数收：参数能被随手改，而「同预算」要证明的是
+          // 「两次跑用的是同一份配置」。与 `recordRun` 里自动采集的起点快照配对，
+          // 两者齐了才叫「同条件」。
+          budget: { evalTimeoutMs: roundConfig.evalTimeoutMs },
         })
         return { text: '子智能体已派发：run ' + runId + '（session ' + started.childId + '）\n注意：caller 投递只投递初始 prompt、不发完成通知也不唤醒——须由主会话显式发消息唤醒。' }
       }
