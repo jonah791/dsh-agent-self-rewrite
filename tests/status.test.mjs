@@ -456,3 +456,42 @@ test('snapshot：饥饿读数进载荷；hint 优先级 = 链停 > 饥饿 > 最�
   assert.ok(!healthy.line.includes('零证据'), '全采到时摘要不带饥饿段')
   assert.ok(healthy.hint.includes('最接近阈值'), '正常状态给推进提示')
 })
+
+// ── 使能型兑现后的假告警（2026-11-03 · 抓于兑现 h-mvzxyz4w-1 当场） ──────────────
+//
+// 修的是一个「**注释写对了、实现漏了一种情况**」的洞：上方那条注释明确写着
+// 「使能型声明天然零证据 ⇒ 应排除」，但判据只认 `status === 'pending'`，
+// 而 `fulfill` 恰恰把状态从 `pending` 改成 `confirmed` ⇒ **兑现那一刻就漏进统计**。
+// 实测：兑现后 `rewrite_status` 立刻报「⚠ 已裁 confirmed 1 条（状态机不该产出此组合，请查）」。
+// 代价不是多一行字，是**信号面从此对每次 fulfill 都响**，真该查的那条被淹。
+// ⇒ 判据改成看**形态**（`enabling.fulfilledAt` 有值 = 已兑现的使能型），不看状态字。
+
+const enablingBase = (status, extra = {}) => ({
+  ...bare(status, 'enabling', 0, '2026-11-01T00:00:00.000Z'),
+  ...extra,
+})
+
+test('★ 尸体：使能型**兑现后**（confirmed + fulfilledAt）零证据不算饥饿', () => {
+  const fulfilled = enablingBase('confirmed', {
+    enabling: { deps: ['此后每写一个机制都先问挂点'], fulfilledAt: '2026-11-03T00:00:00.000Z', fulfilledRefs: ['AGENTS.md:§3.4'] },
+  })
+  const s = starvationOf([fulfilled], fixedNow)
+  assert.equal(s.zeroEvidence, 0, '已兑现的使能型不得计入饥饿——它的证据是「依赖路径建立」，不是 finding')
+  assert.equal(s.confirmedWithoutEvidence, 0, '**这条正是假告警的来源**，修好后必须为 0')
+  assert.equal(s.rows.length, 0, '清单里也不该出现')
+})
+
+test('回归：使能型**未兑现**（pending）同样不计入——别为了修上一条把这条改坏', () => {
+  const pending = enablingBase('pending', { enabling: { deps: ['d1'] } })
+  const s = starvationOf([pending], fixedNow)
+  assert.equal(s.zeroEvidence, 0, 'pending 的排除是 2026-10-25 就有的行为，必须保持')
+})
+
+test('★ 对照组必须仍然报：普通 confirmed 零证据 ⇒ 该告警保留（「关掉」与「修好」长得一样）', () => {
+  // 修这条时最容易的错法是直接把 `confirmedWithoutEvidence` 关掉。
+  // 那样信号面就再也不会指出「证据型假设没有任何证据却裁了 confirmed」这个真异常。
+  const plain = bare('confirmed', 'claim-vs-evidence', 3, '2026-11-01T00:00:00.000Z')
+  const s = starvationOf([plain], fixedNow)
+  assert.equal(s.zeroEvidence, 1, '普通 confirmed 零证据必须照报')
+  assert.equal(s.confirmedWithoutEvidence, 1, '**这条断言就是「没关掉」的证据**')
+})

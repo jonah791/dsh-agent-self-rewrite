@@ -365,6 +365,13 @@ export function starvationOf(hypotheses: readonly Hypothesis[], now: Date): Star
     // 漏排会让「已收敛的假设」与「真采不到的假设」同貌——当日实测报「零证据 9 条」，
     // 逐条查下来 7 条是 archived、1 条已 refuted，**真正待查的只有 1 条 active**。
     if (h.status === 'pending' || h.status === 'archived') continue
+    // ⚠⚠ 使能型**兑现之后**（`pending` → `confirmed`）同样是零证据且正常——它的证据是
+    //   「依赖路径建立」，不是 finding。上面那句注释早就写了「使能型应排除」，但判据只认
+    //   `pending` 这个**状态字**，于是兑现那一刻就漏了：2026-11-03 08:23 兑现 h-mvzxyz4w-1
+    //   后，`rewrite_status` 立刻报「⚠ 已裁 confirmed 1 条（状态机不该产出此组合，请查）」。
+    //   这个假告警的代价不是多一行字，是**信号面从此对每次 fulfill 都响**，真该查的那条被淹。
+    //   ⇒ 判据改成看**形态**（带 `enabling.fulfilledAt` = 已兑现的使能型）而不是看状态字。
+    if (h.enabling !== undefined && h.enabling.fulfilledAt !== undefined) continue
     const kind = typeof h.probe?.kind === 'string' && h.probe.kind.length > 0 ? h.probe.kind : '(未标探针)'
     const slot = perProbe.get(kind) ?? { total: 0, zero: 0, oldest: null }
     slot.total += 1
