@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-self-rewrite"><img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-282%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-333%20passed-brightgreen" alt="tests">
 </p>
 
 `AGENTS.md` 标记段的**唯一写者**：把「猜想 → 采证 → 裁决 → 写入 → 跨代验证 → 保留或回滚」做成一条有单一 owner 的闭环。
@@ -95,4 +95,4 @@ unmount 本件 → 把 `dsh-agent-self-test` / `dsh-agent-evolve` 从 `_archive/
 cd self-plugins/dsh-agent-self-rewrite && npm test
 ```
 
-**282 条用例**（跑一次得到）。
+**333 条用例**（2026-11-03 实测 `tests 333 / pass 333 / fail 0 / skipped 0`，25 个测试文件）。
