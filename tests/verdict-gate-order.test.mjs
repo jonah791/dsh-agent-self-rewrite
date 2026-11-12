@@ -94,7 +94,7 @@ const statusOf = (dataDir) =>
 // ── ★ 尸体①：顺序错位（旧行为的形状）─────────────────────────────────
 test('★ 闸门拒（无冻结账）⇒ **裁决未发生**：假设仍是 finding，规则未写入', async () => {
   await withFixture(async ({ rules, dataDir, tools }) => {
-    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE })
+    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE, regression: '会让已有闸门路径变坏——本用例只测顺序，不测回归面' })
 
     assert.ok(r.text.includes('⛔'), `闸门应显式拒绝：${r.text}`)
     assert.ok(r.text.includes('外生接受位拒绝'), r.text)
@@ -113,7 +113,7 @@ test('★ 闸门拒（无冻结账）⇒ **裁决未发生**：假设仍是 find
 // ── ★ 尸体②：静默绕过 ────────────────────────────────────────────────
 test('★ acceptanceGate=false ⇒ 规则照写，但输出带警告 + trace 落 bypassed（绕过不静默）', async () => {
   await withFixture(async ({ rules, home, dataDir, tools }) => {
-    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE })
+    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE, regression: '会让已有闸门路径变坏——本用例只测顺序，不测回归面' })
 
     assert.ok(r.text.includes('未过外生接受位'),
       `关掉闸门必须在输出里说出来（静默绕过才是危险的）：${r.text}`)
@@ -146,7 +146,7 @@ test('闸门通过（合法冻结账 + 注入器红 + 对照绿）⇒ confirmed 
       expect: { injected: 1, benign: 0 },
     }), 'utf8')
 
-    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE })
+    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE, regression: '会让已有闸门路径变坏——本用例只测顺序，不测回归面' })
 
     assert.equal(statusOf(dataDir), 'confirmed', `闸门应放行：${r.text}`)
     assert.ok(readFileSync(rules, 'utf8').includes('空值合并运算符'),
@@ -161,10 +161,36 @@ test('闸门通过（合法冻结账 + 注入器红 + 对照绿）⇒ confirmed 
 // ── 单比特：trace 不得含分数与逐样本结果 ──────────────────────────────
 test('★ trace 只有单比特 + 拒因，**不含分数与逐样本结果**（leaky-anchor）', async () => {
   await withFixture(async ({ home, tools }) => {
-    await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE })
+    await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE, regression: '会让已有闸门路径变坏——本用例只测顺序，不测回归面' })
     const trace = readFileSync(join(home, 'acceptance-gate-trace.jsonl'), 'utf8').trim()
     const row = JSON.parse(trace.split('\n')[0])
     assert.deepEqual(Object.keys(row).sort(), ['accepted', 'at', 'reason', 'ruleId', 'stage'],
       `trace 键集被污染（分数会变成新目标）：${trace}`)
+  })
+})
+
+// ── ★ 尸体②：缺回归面（2026-11-12 增补 · 借自 FGSE 的 R(h)）────────────────
+
+test('★ 缺 regression ⇒ **裁决未发生**：状态仍 finding，规则未写，且拦在闸门之前', async () => {
+  await withFixture(async ({ rules, dataDir, tools }) => {
+    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE })
+
+    assert.ok(r.text.includes('⛔'), `应显式拒绝：${r.text}`)
+    assert.ok(r.text.includes('缺回归面'), r.text)
+    // 关键：拦在闸门**之前**——所以输出里不该出现闸门拒因（那会证明顺序又错了）
+    assert.equal(r.text.includes('外生接受位拒绝'), false,
+      '回归面校验必须在闸门之前拦，走到闸门说明顺序错（会白跑一次验收并留下 trace）')
+
+    assert.equal(statusOf(dataDir), 'finding', '缺回归面却把假设裁了——脏状态')
+    assert.equal(readFileSync(rules, 'utf8').includes('空值合并运算符'), false, '缺回归面却写了规则')
+  })
+})
+
+test('对照组②：regression=「未发现」⇒ 不拦（想了没发现是判断，不是缺失）', async () => {
+  await withFixture(async ({ tools }) => {
+    const r = await runVerdict(tools, { id: 'h-testgate-1', verdict: 'confirm', ruleDraft: RULE, regression: '未发现' })
+    assert.equal(r.text.includes('缺回归面'), false, `不该被回归面拦：${r.text}`)
+    // 继续走到闸门（本 fixture 无冻结账 ⇒ 必然是闸门拒）——证明没有误伤正常路径
+    assert.ok(r.text.includes('外生接受位拒绝'), `应继续走到闸门：${r.text}`)
   })
 })

@@ -123,6 +123,18 @@ export interface Hypothesis {
   note?: string
   resolution?: string
   /**
+   * 回归面（2026-11-12）：**「这条规则会让哪些现在做对的事变坏」**。
+   *
+   * 来源是 FGSE（arXiv:2611.14326）三组探针里的 `R(h)`（archived-regression）。
+   * 只借这一件，因为另外两组（target-transfer / falsification）的判别力全部来自可执行
+   * verifier `v_h`，而我没有 verifier —— 我的「探针」只能是我自己想象的场景，那不是验证。
+   * 回归面不同：它是一句**提问**，纯推理可答，答案还能落盘供未来核对。
+   *
+   * 必填（有 ruleDraft 的 confirm 时）。允许答「未发现」，但**空着与「想了没发现」必须可区分**
+   * ——判断型字段禁默认值。拒绝逻辑在工具层（`index.ts`），本字段只负责记录。
+   */
+  regression?: string
+  /**
    * 使能型声明（论文 `arXiv:2610.14625v1` §3.6 的维度失配）：改日志、修判据一类改动
    * **不改变即时读数**，却让后续诊断或修复成为可能——用即时分数做验收会把它们判成「无收益」而丢弃。
    *

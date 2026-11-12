@@ -39,6 +39,7 @@ import { gateTraceLine } from './gate.js'
 import {
   addHypothesis,
   applyVerdict,
+  missingRegression,
   purgeHypothesis,
   fulfillHypothesis,
   backupsDir,
@@ -680,18 +681,20 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(tool({
     name: 'rewrite_verdict',
     description: '裁决 finding 并当场布线——**唯一写 AGENTS.md 标记段的入口**。verdict=confirm（需 finding）会按 ruleDraft 累积写入并生成记录；refute 淘汰；refine 细化后重新采证；**confounded = 证据不足或无法隔离归因**（独立态，不逼你在 confirm/refute 之间二选一；非终态，补足证据后可再裁）。'
-      + '裁决前用 polarity.ts 算证据方向，动作与方向相悖时返回护栏提示（**只提示不阻断**，决策权归主体）。超预算一律拒写，绝不截断。',
+      + '裁决前用 polarity.ts 算证据方向，动作与方向相悖时返回护栏提示（**只提示不阻断**，决策权归主体）。超预算一律拒写，绝不截断。'
+      + '**带 ruleDraft 的 confirm 必须给 `regression`**（回归面：这条规则会让哪些现在做对的事变坏）；缺则裁决不发生。',
     parameters: {
       id: { type: 'string', required: true, description: '假设 id' },
       verdict: { type: 'string', required: true, description: 'confirm | refute | refine | confounded（confounded = 无法归因，需在 resolution 说明为何证据不足或哪几处改动纠缠在一起）' },
       ruleDraft: { type: 'string', description: 'confirm 时：要写入 AGENTS.md 的规则文本' },
+      regression: { type: 'string', description: 'confirm 且有 ruleDraft 时**必填**：这条规则会让哪些**现在做对的事变坏**（回归面）。想不出也要写「未发现」——空着与「想了没发现」是两件事。' },
       newStatement: { type: 'string', description: 'refine：新陈述' },
       newThreshold: { type: 'number', description: 'refine：新阈值' },
       polarity: { type: 'string', description: '修正极性：violation-refutes | violation-supports' },
       resolution: { type: 'string', description: '裁决记录' },
     },
     output: textOut,
-    async execute(args: { id: string; verdict: Verdict; ruleDraft?: string; newStatement?: string; newThreshold?: number; polarity?: string; resolution?: string }) {
+    async execute(args: { id: string; verdict: Verdict; ruleDraft?: string; regression?: string; newStatement?: string; newThreshold?: number; polarity?: string; resolution?: string }) {
       // ★ 外生接受位**先行**（2026-11-03 · t-366b5933「验收优先于 Teacher」）
       //
       // 顺序为什么是承重的：闸门原先在 `applyVerdict` **之后**跑，被拒时状态已落盘
@@ -700,6 +703,20 @@ export function apply(ctx: Context, config: Config): void {
       // 而不是「裁决发生了，只是布线被拦」。
       const draft = args.ruleDraft
       const wantsWiring = args.verdict === 'confirm' && draft !== undefined && draft.trim().length > 0
+      // ★ 回归面准入（2026-11-12）。位置刻意在闸门**之前**，与外生接受位同一条原则：
+      // 确定性层说不行 ⇒ **裁决不发生**，而不是「裁决发生了、只是少一个字段」。
+      // 来源：FGSE（arXiv:2611.14326）三组探针里的 R(h)。只借这一件——另外两组要可执行
+      // verifier，我没有；回归面是**提问**，纯推理可答（记忆 f59228e1 有完整判断）。
+      // 判断型字段禁默认值：允许答「未发现」，但空着 ≠ 想了没发现，前者是没想，必须拒。
+      if (missingRegression(args.verdict, args.ruleDraft, args.regression)) {
+        return {
+          text: '⛔ **缺回归面**：带 ruleDraft 的 confirm 必须给 `regression` —— 一句话说清这条规则'
+            + '**会让哪些现在做对的事变坏**。\n'
+            + '想不出也要写「未发现」：空着 = 没想，写「未发现」= 想了但没有——这两件事必须可区分'
+            + '（判断型字段禁默认值）。\n\n'
+            + '**本次裁决未发生**（假设状态未改动，规则未写入 AGENTS.md）。补上 `regression` 重新 confirm 即可。',
+        }
+      }
       let gateBypassed = false
       if (wantsWiring && draft !== undefined) {
         if (config.acceptanceGate) {
@@ -746,6 +763,7 @@ export function apply(ctx: Context, config: Config): void {
         ...(args.newThreshold !== undefined ? { newThreshold: args.newThreshold } : {}),
         ...(args.polarity !== undefined ? { polarity: args.polarity as Parameters<typeof applyVerdict>[1]['polarity'] } : {}),
         ...(args.resolution !== undefined ? { resolution: args.resolution } : {}),
+        ...(args.regression !== undefined ? { regression: args.regression } : {}),
       })
       saveHypotheses(paths, state)
 
@@ -777,6 +795,7 @@ export function apply(ctx: Context, config: Config): void {
         text: '裁决完成：[' + outcome.hypothesis.id + '] → ' + outcome.hypothesis.status
           + '（证据 ' + String(outcome.hypothesis.evidence.length) + ' 条；方向 ' + outcome.direction.direction + '）'
           + wired
+          + (args.regression !== undefined ? '\n回归面已记录：' + args.regression : '')
           + (gateBypassed
             ? '\n⚠ **本轮未过外生接受位**（config.acceptanceGate=false）——规则已写入，但没有任何冻结点为它担保。'
               + '这条警告是刻意的：绕过本身可审，不留痕的绕过才是危险的。'

@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { applyBlockSet, applyRuleUpsert, buildBlock, byteLength, extractBlockInner, findBlock, MANAGED_BLOCKS } from '../lib/wiring.js'
-import { addHypothesis, applyVerdict, enrich, purgeHypothesis, recordEvidence, requireHypotheses, saveHypotheses } from '../lib/hypotheses.js'
+import { addHypothesis, applyVerdict, enrich, missingRegression, purgeHypothesis, recordEvidence, requireHypotheses, saveHypotheses } from '../lib/hypotheses.js'
 import { buildTaskPrompt, extractRules } from '../lib/rounds.js'
 import { resolveLegacyPaths } from '../lib/store.js'
 
@@ -204,4 +204,47 @@ test('buildTaskPrompt：有规则则附「本体规则」节，无规则则不�
   const without = buildTaskPrompt('任务说明书', '   ')
   assert.ok(!without.includes('【本体规则'))
   assert.ok(without.includes('【输出】'))
+})
+
+// ── 回归面（2026-11-12 · 借自 FGSE 的 R(h)：只取「提问」，不假装它是验证）────────────
+
+test('missingRegression：带 ruleDraft 的 confirm 没给 regression ⇒ 判缺', () => {
+  assert.equal(missingRegression('confirm', '规则文本', undefined), true)
+})
+
+test('尸体：空白字符串不是回答（`   ` 也算缺）', () => {
+  assert.equal(missingRegression('confirm', '规则文本', '   '), true)
+})
+
+test('「未发现」算回答——空着 ≠ 想了没发现（判断型字段禁默认值）', () => {
+  assert.equal(missingRegression('confirm', '规则文本', '未发现'), false)
+})
+
+test('对照组：不需要回归面的情形都不该被拒', () => {
+  // confirm 但没有 ruleDraft（不写规则）
+  assert.equal(missingRegression('confirm', undefined, undefined), false)
+  // confirm + 空白 ruleDraft（同样不写）
+  assert.equal(missingRegression('confirm', '  ', undefined), false)
+  // 其余三态不写规则
+  assert.equal(missingRegression('refute', 'x', undefined), false)
+  assert.equal(missingRegression('refine', 'x', undefined), false)
+  assert.equal(missingRegression('confounded', 'x', undefined), false)
+})
+
+test('applyVerdict：confirm 把 regression 记进假设（供未来核对当时想的反面）', () => {
+  const state = { hypotheses: [] }
+  const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
+  recordEvidence(h, { ts: 't', kind: 'read-repeat', detail: { verdict: 'violated' } })
+  const out = applyVerdict(state, { id: h.id, verdict: 'confirm', ruleDraft: '规则文本', regression: '会让 X 变坏' })
+  assert.equal(out.hypothesis.status, 'confirmed')
+  assert.equal(out.hypothesis.regression, '会让 X 变坏')
+})
+
+test('applyVerdict：不给 regression 时不伪造值（拒绝归工具层，纯函数不 throw）', () => {
+  const state = { hypotheses: [] }
+  const { hypothesis: h } = addHypothesis(state, { statement: 's', prediction: 'p', kind: 'read-repeat', threshold: 1 })
+  recordEvidence(h, { ts: 't', kind: 'read-repeat', detail: { verdict: 'violated' } })
+  const out = applyVerdict(state, { id: h.id, verdict: 'confirm', ruleDraft: '规则文本' })
+  assert.equal(out.hypothesis.status, 'confirmed')
+  assert.equal(out.hypothesis.regression, undefined, '缺省不得有默认值')
 })

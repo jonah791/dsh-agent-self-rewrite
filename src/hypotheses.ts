@@ -167,6 +167,36 @@ export interface VerdictInput {
   readonly newThreshold?: number
   readonly polarity?: Polarity
   readonly resolution?: string
+  /** 回归面：「这条规则会让哪些现在做对的事变坏」——有 ruleDraft 的 confirm 必填（工具层强制） */
+  readonly regression?: string
+}
+
+/**
+ * 回归面准入判据（2026-11-12）：这条裁决**是不是缺了回归面、该被拒**。
+ *
+ * 抽成纯函数而不是写死在工具层，理由是可测性——「拒」的判据如果埋在 `execute` 里，
+ * 只能靠真跑一次工具来验证，而真跑需要造一个 finding 状态的假设（成本高、易腐）。
+ *
+ * 三条边界：
+ * 1. **只有带 ruleDraft 的 confirm 需要**——refute / refine / confounded 不写规则，
+ *    谈不上回归面（硬套会让它们变成走形式）。
+ * 2. **空串与空白算缺**——`'  '` 不是回答。
+ * 3. **「未发现」不算缺**——想过了没找到，是判断；空着是没想。两者必须可区分
+ *    （判断型字段禁默认值）。
+ *
+ * @param verdict - 裁决动作
+ * @param ruleDraft - 要写入的规则文本
+ * @param regression - 回归面回答
+ * @returns 缺回归面 ⇒ true（调用方据此拒绝本次裁决）
+ */
+export function missingRegression(
+  verdict: Verdict,
+  ruleDraft: string | undefined,
+  regression: string | undefined,
+): boolean {
+  const wantsWiring = verdict === 'confirm' && ruleDraft !== undefined && ruleDraft.trim().length > 0
+  if (!wantsWiring) return false
+  return regression === undefined || regression.trim().length === 0
 }
 
 export interface VerdictOutcome {
@@ -226,6 +256,10 @@ export function applyVerdict(state: SelfTestState, input: VerdictInput, now: Dat
     h.status = 'confirmed'
     h.resolution = note(input.resolution ?? 'confirmed by evidence')
     if (input.ruleDraft !== undefined) h.note = input.ruleDraft
+    // 回归面：**记录**归这里，**拒绝**归工具层（index.ts 在闸门之前拦）。
+    // 分开的理由：applyVerdict 是纯函数、被测试直接调，在里面 throw 会把「记录职责」
+    // 和「准入职责」焊死，而两者的失败代价不同（一个脏一条记录，一个让裁决不发生）。
+    if (input.regression !== undefined) h.regression = input.regression
     needsWiring = input.ruleDraft !== undefined && input.ruleDraft.trim().length > 0
   } else if (input.verdict === 'refute') {
     h.status = 'refuted'
